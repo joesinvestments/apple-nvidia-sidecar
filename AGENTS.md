@@ -85,7 +85,7 @@ The rules are in **[CONTRIBUTING.md](CONTRIBUTING.md)**. Read it before you open
 follow it whether a person or an agent writes the text. The short version:
 
 - Start every issue and pull request title with its area: `[Engine]`, `[GUI]`, `[TUI]`, `[Benchmark]`, `[Docs]` or
-  `[Other]`, for example `[Engine] fix …`. A check on GitHub fails a pull request whose title has no area.
+  `[Other]`, for example `[Engine] fix …`.
 - Search the open and closed issues and pull requests first, and add to a thread that already covers your point.
 - Agree the scope in an issue before a large feature, a refactor or a change to a default.
 - One problem per pull request. Lead with the problem and the result, then the approach, then the validation

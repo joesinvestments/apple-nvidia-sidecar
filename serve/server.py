@@ -3200,6 +3200,8 @@ class Vision:
     """The resident image encoder: `strata-vision` (llama.cpp mtmd + the mmproj file) reads `ENC <image> <out>`
     lines and writes each image's embeddings; results are cached by the image's hash, so a conversation that
     sends the same picture again (every turn, with most clients) encodes it once."""
+    idle_unloaded = False                               # __init__ sets both; defaults for code that builds this without it
+    on_start = None
 
     @staticmethod
     def work_dir() -> Path:
