@@ -6,6 +6,7 @@
 #include "strata/kernels/gfx_arch.hpp"
 #include "strata/kernels/router_top10.hpp"
 #include "strata/core/emulate.hpp"
+#include "xport8_kernels.cuh"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -3221,7 +3222,7 @@ namespace {
 __global__ void moe_combine_peer_kernel(const float* __restrict__ Dm, const int32_t* __restrict__ slot,
                                         const float* __restrict__ w, const float* __restrict__ shared,
                                         const float* __restrict__ sg, const float* __restrict__ peer, int64_t rows_local,
-                                        float* __restrict__ bo, int64_t T) {
+                                        float* __restrict__ bo, int64_t T, const float* __restrict__ row_sd) {
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= T * N) return;
     const int64_t t = i / N, d = i % N;
@@ -3229,7 +3230,7 @@ __global__ void moe_combine_peer_kernel(const float* __restrict__ Dm, const int3
 #pragma unroll
     for (int k = 0; k < 10; ++k) {
         const int32_t r = slot[t * 10 + k];
-        if (r < rows_local) s = fmaf(w[t * 10 + k], Dm[(int64_t) r * N + d], s);
+        if (r >= 0 && r < rows_local) s = fmaf(w[t * 10 + k], row_sd ? Dm[(int64_t) r * N + d] * row_sd[r] : Dm[(int64_t) r * N + d], s);   // moe_combine's NVFP4 s_down
     }
     bo[i] = (s + peer[i]) + shared[i] * sigm(sg[t]);
 }
@@ -3245,7 +3246,7 @@ __global__ void peer_scatter_add_kernel(float* __restrict__ sum, const float* __
 __global__ void moe_combine_peer16_kernel(const float* __restrict__ Dm, const int32_t* __restrict__ slot,
                                           const float* __restrict__ w, const float* __restrict__ shared,
                                           const float* __restrict__ sg, const uint16_t* __restrict__ peer16,
-                                          int64_t rows_local, float* __restrict__ bo, int64_t T) {
+                                          int64_t rows_local, float* __restrict__ bo, int64_t T, const float* __restrict__ row_sd) {
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= T * N) return;
     const int64_t t = i / N, d = i % N;
@@ -3253,7 +3254,7 @@ __global__ void moe_combine_peer16_kernel(const float* __restrict__ Dm, const in
 #pragma unroll
     for (int k = 0; k < 10; ++k) {
         const int32_t r = slot[t * 10 + k];
-        if (r < rows_local) s = fmaf(w[t * 10 + k], Dm[(int64_t) r * N + d], s);
+        if (r >= 0 && r < rows_local) s = fmaf(w[t * 10 + k], row_sd ? Dm[(int64_t) r * N + d] * row_sd[r] : Dm[(int64_t) r * N + d], s);   // moe_combine's NVFP4 s_down
     }
     bo[i] = (s + __half2float(__ushort_as_half(peer16[i]))) + shared[i] * sigm(sg[t]);
 }
@@ -3287,10 +3288,21 @@ __global__ void f16_to_f32_wide_kernel(float4* __restrict__ dst, const uint4* __
 }
 }  // namespace
 void moe_combine_peer16(const float* Dm, const int32_t* slot, const float* w, const float* shared, const float* sg,
-                        const uint16_t* peer16, int64_t rows_local, float* bo, int64_t T, void* stream) {
+                        const uint16_t* peer16, int64_t rows_local, float* bo, int64_t T, void* stream, const float* row_sd) {
     moe_combine_peer16_kernel<<<blocks_for(T * N), 256, 0, (cudaStream_t) stream>>>(Dm, slot, w, shared, sg, peer16,
-                                                                                      rows_local, bo, T);
+                                                                                      rows_local, bo, T, row_sd);
     check("moe_combine_peer16");
+}
+// STRATA_PF_XPORT8: the lane's x rows (fp16 -> packed int8 block-32, before the device-to-host copy) and y rows (packed -> fp16, after the host-to-device copy); xport8_kernels.cuh
+void xport8_quant(const uint16_t* x16, uint8_t* out, int64_t n, void* stream) {
+    if (n <= 0 || n % 32 != 0) { std::fprintf(stderr, "prefill xport8_quant: n=%lld is not a multiple of 32\n", (long long) n); std::exit(1); }
+    xp8::launch_quant(x16, out, n, (cudaStream_t) stream);
+    check("xport8_quant");
+}
+void xport8_dequant(const uint8_t* in, uint16_t* out16, int64_t n, void* stream) {
+    if (n <= 0 || n % 32 != 0) { std::fprintf(stderr, "prefill xport8_dequant: n=%lld is not a multiple of 32\n", (long long) n); std::exit(1); }
+    xp8::launch_dequant(in, out16, n, (cudaStream_t) stream);
+    check("xport8_dequant");
 }
 void peer_gather_add(float* sum, const float* rows, int64_t r0, const float* wk, const int32_t* pair, const int32_t* tok,
                      const int32_t* start, const int32_t* list, int64_t n_tok, void* stream) {
@@ -3311,9 +3323,9 @@ void f16_to_f32_wide(float* dst, const uint16_t* src, int64_t n, void* stream) {
     check("f16_to_f32_wide");
 }
 void moe_combine_peer(const float* Dm, const int32_t* slot, const float* w, const float* shared, const float* sg,
-                      const float* peer, int64_t rows_local, float* bo, int64_t T, void* stream) {
+                      const float* peer, int64_t rows_local, float* bo, int64_t T, void* stream, const float* row_sd) {
     moe_combine_peer_kernel<<<blocks_for(T * N), 256, 0, (cudaStream_t) stream>>>(Dm, slot, w, shared, sg, peer, rows_local,
-                                                                                    bo, T);
+                                                                                    bo, T, row_sd);
     check("moe_combine_peer");
 }
 void peer_scatter_add(float* sum, const float* rows, const float* wk, const int32_t* pair, int64_t n, void* stream) {

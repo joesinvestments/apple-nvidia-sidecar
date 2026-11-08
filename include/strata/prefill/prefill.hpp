@@ -173,6 +173,12 @@ public:
     static uint64_t bytes_needed_no_ring(const core::ModelGeometry& g, const core::SessionState& ss, int64_t chunk,
                                          bool src = true);
 
+    /// STRATA_PF_GROUP=G (EXL3 Mac cold-expert lane, STRATA_PF_MAC=1): G chunks run layer-major in lockstep (one SSD read of a layer's
+    /// cold blobs per group of G chunks).  group_size() is 1 when off; group_extra_bytes() is the device memory the G-1 extra chunks'
+    /// residual streams + QSA step tables cost (counted by bytes_needed / bytes_needed_owned too).
+    static int group_size();
+    static uint64_t group_extra_bytes(int64_t chunk);
+
     /// The streamed ring's byte budget as a slot count for this pack (the measured slot count x Q2_0's blob, over
     /// max_blob, never past ring_cap()):
     /// what the auto chunk scan treats as a full ring.  A slot is one whole blob, so a pack with bigger blobs than

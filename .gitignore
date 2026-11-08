@@ -95,3 +95,10 @@ node_modules/
 /build-spark/
 /build-vision-spark/
 /.venv-build/
+
+# Isolated Side Car build products never enter source control or image contexts.
+/.sidecar-work/
+
+# Model weights and mutable runtime state are supplied on the target rig.
+/weights
+/state/

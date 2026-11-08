@@ -13,7 +13,7 @@
 
 #include <cstring>
 
-#if !defined(__AVX__)
+#if !defined(__AVX__) && !defined(STRATA_TGCU)
 #error "kq_avx1.cpp must be compiled with AVX enabled (see the per-source flags in CMakeLists.txt)"
 #endif
 

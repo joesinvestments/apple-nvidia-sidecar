@@ -447,11 +447,32 @@ int fused_multi_lds_parity(const float* d_norm, const uint16_t* d_down, const ui
                 strata::kernels::native_quantize_q8_1(d_mixed, d_ref, N, tt, stream);
                 check(cudaStreamSynchronize(stream), "qfuse sync");
                 if (qx) { cudaGraphExecDestroy(qx); cudaGraphDestroy(qg); }
+                {   // diag: the group counters must be zero after every launch
+                    std::vector<unsigned> hc(N / 32);
+                    check(cudaMemcpy(hc.data(), d_cnt, hc.size() * 4, cudaMemcpyDeviceToHost), "diag cnt");
+                    int nz = 0, first = -1; for (size_t i = 0; i < hc.size(); ++i) if (hc[i]) { ++nz; if (first < 0) first = (int) i; }
+                    if (nz) std::printf("    diag counters after T=%d rep %d: %d nonzero (first group %d = %u)\n", tt, rep, nz, first, hc[first]);
+                }
                 if (v3) { std::printf("  QFUSE: the v3 read writes no q8_1 (%s)\n", wrote ? "WRONG: it says it did" : "ok"); qbad += wrote; break; }
                 check(cudaMemcpy(hq.data(), d_q, (size_t) tt * (N / 32) * 36, cudaMemcpyDeviceToHost), "qfuse read");
                 check(cudaMemcpy(hr.data(), d_ref, (size_t) tt * (N / 32) * 36, cudaMemcpyDeviceToHost), "qfuse ref read");
                 if (!wrote || std::memcmp(hq.data(), hr.data(), (size_t) tt * (N / 32) * 36) != 0) {
                     std::printf("  QFUSE: T=%d rep %d: %s\n", tt, rep, wrote ? "q8_1 bytes differ" : "not written");
+                    {   // diag: per token, the groups whose 36-byte block differs, and the first one's bytes
+                        const int G = N / 32;
+                        for (int t = 0; t < tt; ++t) {
+                            int nd = 0, first = -1;
+                            for (int gi = 0; gi < G; ++gi)
+                                if (std::memcmp(&hq[((size_t) t * G + gi) * 36], &hr[((size_t) t * G + gi) * 36], 36) != 0) { if (first < 0) first = gi; ++nd; }
+                            std::printf("    diag token %d: %d of %d groups differ", t, nd, G);
+                            if (first >= 0) {
+                                const uint8_t* a = &hq[((size_t) t * G + first) * 36]; const uint8_t* b = &hr[((size_t) t * G + first) * 36];
+                                std::printf(" (group %d: got %02x%02x%02x%02x q0 %d q1 %d, want %02x%02x%02x%02x q0 %d q1 %d)", first, a[0], a[1], a[2], a[3],
+                                            (int) (int8_t) a[4], (int) (int8_t) a[5], b[0], b[1], b[2], b[3], (int) (int8_t) b[4], (int) (int8_t) b[5]);
+                            }
+                            std::printf("\n");
+                        }
+                    }
                     ++qbad;
                 }
             }

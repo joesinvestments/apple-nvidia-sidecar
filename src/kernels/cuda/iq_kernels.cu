@@ -5583,8 +5583,8 @@ __device__ __forceinline__ float row_dot64(const uint8_t* row, const block_q8_1*
         const int kbx = k / F::ipb, iqs = F::step * (k % F::ipb);
         s += F::dot(row, x + kbx * (F::qk / 32), kbx, iqs);
     }
-#pragma unroll
 #if defined(__HIPCC__)
+#pragma unroll
     for (int o = 32; o > 0; o >>= 1) s += __shfl_xor(s, o, 64);
 #else
     __trap();   // a 64-lane wavefront: mode 1 is gfx906's only

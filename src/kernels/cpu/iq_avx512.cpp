@@ -1,3 +1,15 @@
+#if defined(STRATA_TGCU)   // STRATA_TGCU stub: the Mac build (arm64) has no AVX-512; same answer as upstream's Apple-build stubs_025.cpp
+#include "strata/kernels/cpu/iq_avx512.hpp"
+#include <cstdio>
+#include <cstdlib>
+namespace strata::kernels::cpu {
+bool iq512_gather_on() noexcept { return false; }
+bool iq512x_supported(int) noexcept { return false; }
+void iq512_gu_rows(int, const uint8_t*, size_t, size_t, int, const void* const*, int, float* const*, int, int) { std::fprintf(stderr, "iq512_gu_rows: no AVX-512 on this build\n"); std::abort(); }
+void iq512_rows(int, const uint8_t*, size_t, int, const void* const*, int, float* const*, int, int) { std::fprintf(stderr, "iq512_rows: no AVX-512 on this build\n"); std::abort(); }
+void iq512x_rows(int, const uint8_t*, size_t, int, const void* const*, int, float* const*, int, int) { std::fprintf(stderr, "iq512x_rows: no AVX-512 on this build\n"); std::abort(); }
+}  // namespace strata::kernels::cpu
+#else
 // src/kernels/cpu/iq_avx512.cpp - plan v0.3 P6: the i-quant expert rows in 512-bit lanes, several tokens at once.
 //
 // ggml-cpu's x86 dot products for these formats are AVX2 and single-token: every token re-decodes the weights
@@ -658,3 +670,5 @@ void iq512x_rows(int type, const uint8_t* w, size_t row_bytes, int n, const void
 }
 
 }  // namespace strata::kernels::cpu
+
+#endif  // STRATA_TGCU

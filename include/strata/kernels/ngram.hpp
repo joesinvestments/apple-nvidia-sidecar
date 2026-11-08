@@ -191,6 +191,9 @@ public:
     /// table: scale 0 and code 8 everywhere, which decode to the +0.0f gather_batch writes) for ple_iq4nl_dequant on the device.  False (nothing
     /// written) unless the table is in memory (--ple-io ram / mmap) and IQ4_NL.
     bool gather_raw_iq4nl(const uint32_t* rows, size_t n_tokens, uint8_t* out) const;
+    /// Prefill600: read `n_rows` rows (a chunk's `rows`, 16 per token) into the reader's row cache and throw the data away, so a later `gather_batch` of the same
+    /// rows is served from the cache.  Safe beside a `gather_batch` on another thread (the reader serialises requests); Direct mode only (else a no-op).
+    bool warm_rows(const uint32_t* rows, size_t n_rows, std::string& err);
 
     /// Fault injection (Direct mode): every row read completes no earlier than `us` after issue.
     void set_injected_delay_us(double us);

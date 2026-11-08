@@ -803,6 +803,9 @@ public:
     /// --pipeline-windows: size the exchange table now, so a `stage_exchange` on the adaptive tier's thread never
     /// reallocates it under a concurrent `blob` (the pool reads it while windows are in flight).
     void prepare_overrides() { if (override_.empty()) override_.assign((size_t) blobs_, nullptr); }
+    /// the exchange's Mac copy of every cold expert (strata_xch_setup's table: Metal LRU slots, static while the window runs).
+    /// blob() and blob_stable() read it before the files, so the card's prompt path takes cold experts from RAM, not the SSD.
+    void set_mac_copies(std::vector<const uint8_t*> t) { mac_copy_ = std::move(t); }
     /// After the GPU copies of every staged swap have landed.  Returns how many exchanges were applied.
     int64_t commit_exchanges();
     /// 0.1.43 (STRATA_ADAPT_OVERLAP): BEFORE the GPU copies of the staged swaps have landed, make each staged `out` look to the
@@ -1218,6 +1221,7 @@ private:
     int64_t complement_lent_slots_ = 0;
     std::vector<std::vector<std::pair<int32_t, int32_t>>> stage_lend_regions_;  ///< a split: each stage's lend region
     std::vector<const uint8_t*> override_;    ///< staged exchanges: an evicted expert read from its exchange buffer
+    std::vector<const uint8_t*> mac_copy_;    ///< the exchange's Mac copy per (layer, expert), or empty
     struct Exchange { size_t in, out; int64_t q; uint64_t bytes; };
     std::vector<Exchange> staged_;
     std::atomic<ForesightSwap*> fs_swap_{nullptr};   ///< set_foresight_swap

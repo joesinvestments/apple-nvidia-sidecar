@@ -32,10 +32,10 @@
 #include <cstdlib>
 #include <cstring>
 
-#if !defined(__AVX__)
+#if !defined(__AVX__) && !defined(STRATA_TGCU)
 #error "iq_avx1.cpp must be compiled with AVX enabled (see the per-source flags in CMakeLists.txt)"
 #endif
-#if defined(__FMA__) || defined(__F16C__)
+#if (defined(__FMA__) || defined(__F16C__)) && !defined(STRATA_TGCU)
 #error "iq_avx1.cpp must be compiled without FMA/F16C: it runs on CPUs (Sandy/Ivy Bridge) that lack them"
 #endif
 

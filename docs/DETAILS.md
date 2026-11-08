@@ -501,8 +501,10 @@ applies at the next start. Network, key, MCP and program keys are not editable t
 | `engine_silence_s` | `300` | Ends the engine after this many seconds without a line during a request (`0` = wait forever). While a prompt is read, each chunk may take three times the previous one's time. |
 | `parallel` | `1` | Up to N requests decoded together in batch slots ([BATCHING.md](BATCHING.md)). |
 | `api_monitor` | off | Records requests for `/api-monitor`. |
+| `health_host` | off | `/health` and `/api/health` name the machine under `host`. Off, the body carries no `host`: `/health` answers without an API key, and a port reachable from the LAN or through a tunnel should not tell a caller which machine it is. |
 | `lazy_load` | off | Start without loading the model. |
 | `slot_save_path` | none | Enables session files. |
+| `convpool_cap_gib`, `convpool_min_free_gib` | off, `51` | Turn on the conversation pool's disk tier (the GiB cap; it needs `slot_save_path`) and set the free space a snapshot save must leave on the disk. A save under the floor is skipped, and one line on stderr says so. |
 | `host`, `api_key`, `cors_origins`, `trusted_origins`, `allowed_hosts` | local only | See [Network access](#network-access). |
 | `codex_thread_titles`, `codex_compaction_cache` | off | See [Codex CLI](#the-responses-api-and-codex-cli). |
 | `mcp_servers`, `mcp` | none | See [Tools from MCP servers](#tools-from-mcp-servers). |

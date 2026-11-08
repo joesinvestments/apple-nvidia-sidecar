@@ -15,8 +15,40 @@
 
 namespace strata::kernels::cpu {
 
+/// M4: the nine tensors of an EXL3 expert blob, in exllamav3 exl3_moe_coop's MoeCoopParams order (g_trellis, g_suh,
+/// g_svh, u_trellis, ...), which is also Exl3PlanParams::field_off's order.  The bytes inside the blob are in the
+/// packer's order (three trellises, then the six fp16 vectors); `ExpertLayout::exl3_field_off` maps one to the other.
+enum Exl3Field {
+    EXL3_G_TRELLIS, EXL3_G_SUH, EXL3_G_SVH, EXL3_U_TRELLIS, EXL3_U_SUH, EXL3_U_SVH, EXL3_D_TRELLIS, EXL3_D_SUH,
+    EXL3_D_SVH, EXL3_FIELDS
+};
+
 struct ExpertLayout {
     bool native = false;
+    /// M4: an EXL3 3 bpw pack (~/exl3/pack_exl3.py, exl3_experts.txt): one fixed blob for every layer, K3 MUL1
+    /// trellises plus fp16 sign/scale vectors, expert ids 0..n_expert-1 of the unpruned model.
+    bool exl3 = false;
+    /// EXL3 packs: blob-relative byte offsets of the nine tensors (256-byte aligned), indexed by Exl3Field.
+    uint32_t exl3_field_off[EXL3_FIELDS] = {};
+    /// EXL3 packs with `keep` lines (a pruned model's view of a full-model experts.bin): per layer, the router's
+    /// expert index -> the blob index in the file, whose layers hold `file_n_expert` blobs each.  Empty: identity.
+    std::vector<std::vector<uint16_t>> remap;
+    int64_t file_n_expert = 0;
+    /// EXL3 mixed precision: the header's trellis bit width (3, 4 or 5), so a layer at the header's K keeps the
+    /// header's offsets and a smaller-K layer in the same file stride is rebased.
+    uint8_t exl3_k_header = 3;
+    /// Per layer the trellis bit width (the header's K for its blob, 2 for a smaller blob in the same file stride,
+    /// e.g. stored in a view's unused positions); the file's blob stride stays the header's blob.
+    std::vector<uint8_t> exl3_k;
+    uint64_t exl3_stride = 0;
+    /// Byte offset of field f inside layer `layer`'s blob (trellises are K-sized; the fp16 vectors follow them).
+    uint32_t exl3_off(int64_t layer, int f) const {
+        const int k = exl3_k.empty() ? exl3_k_header : exl3_k[(size_t) layer];
+        if (k == exl3_k_header) return exl3_field_off[f];
+        const uint32_t t_h = 2560u * 640u * (uint32_t) exl3_k_header / 8u, tk = 2560u * 640u * (uint32_t) k / 8u;
+        return f % 3 == 0 ? (uint32_t) (f / 3) * tk : exl3_field_off[f] - 3u * t_h + 3u * tk;
+    }
+    int exl3_bits(int64_t layer) const { return exl3_k.empty() ? exl3_k_header : exl3_k[(size_t) layer]; }
     int64_t n_layers = 0, n_expert = NE;
     std::vector<NativeFmt> fmt;           ///< per layer (native packs)
     std::vector<uint64_t> offset, bytes;  ///< per layer: where its 512 blobs start, bytes per blob
@@ -28,16 +60,17 @@ struct ExpertLayout {
     /// shard boundary can fall inside a layer: Unsloth's UD-Q4_K_XL has layer 11's down in shard 2 and its gate
     /// and up in shard 3 (native_experts.txt v4, the `gate,up,down` shard column).
     std::vector<std::string> gguf_file;
-    int version = 0;                      ///< native_experts.txt's header version (0 = none given)
+    int version = 0;                      ///< native_experts.txt's / exl3_experts.txt's header version (0 = none)
     uint64_t max_blob = BLOB;
     uint64_t total = 0;                   ///< experts.bin size
 
-    uint64_t blob_bytes(int64_t layer) const { return native ? bytes[(size_t) layer] : (uint64_t) BLOB; }
+    uint64_t blob_bytes(int64_t layer) const { return native || exl3 ? bytes[(size_t) layer] : (uint64_t) BLOB; }
     uint64_t layer_offset(int64_t layer) const {
-        return native ? offset[(size_t) layer] : (uint64_t) layer * (uint64_t) n_expert * (uint64_t) BLOB;
+        return native || exl3 ? offset[(size_t) layer] : (uint64_t) layer * (uint64_t) n_expert * (uint64_t) BLOB;
     }
     uint64_t blob_offset(int64_t layer, int64_t expert) const {
-        return layer_offset(layer) + (uint64_t) expert * blob_bytes(layer);
+        const uint64_t e = remap.empty() ? (uint64_t) expert : (uint64_t) remap[(size_t) layer][(size_t) expert];
+        return layer_offset(layer) + e * (exl3 && exl3_stride ? exl3_stride : blob_bytes(layer));
     }
 };
 
@@ -89,15 +122,23 @@ void act_quant_any(const float* x, int n, ActQ& a);
 void q2_rows_any_legacy(const uint8_t* w, size_t row_bytes, int nblocks, const ActQ* const* a, int nt, float* const* out,
                         int r0, int r1);
 
-/// The process-wide layout (canonical Q2_0 until `expert_layout_load` finds a native pack).
+/// The process-wide layout (canonical Q2_0 until `expert_layout_load` finds a native or EXL3 pack).
 const ExpertLayout& expert_layout();
-/// Reads `<pack_dir>/native_experts.txt` when it exists (a native pack), else sets the canonical layout.
-/// Versions up to kExpertLayoutVersion are read; a newer one is refused (a newer packer wrote it).
+/// Reads `<pack_dir>/native_experts.txt` when it exists (a native pack), `<pack_dir>/exl3_experts.txt` when it exists
+/// (an EXL3 pack), else sets the canonical layout.  A pack with both is refused, and so is one with exl3_pack.json
+/// (pack_exl3.py's working manifest) but no exl3_experts.txt: the packer writes that marker last, once every layer
+/// is in experts.bin, so its absence means the pack is still being converted.
+/// Versions up to kExpertLayoutVersion / kExl3LayoutVersion are read; a newer one is refused (a newer packer wrote it).
 bool expert_layout_load(const std::string& pack_dir, int64_t n_layers, int64_t n_expert, std::string& err);
 /// The newest native_experts.txt this engine reads.  v4 = v3 plus the per-role shard column `gate,up,down`,
 /// written only when some layer's roles are in different shards (every other pack stays v3, byte for byte).
 /// v5 = v4 plus `hadamard.txt` beside it: Hadamard-folded experts (hadamard.hpp), written only for such models,
 /// so an engine that cannot rotate the activations refuses the pack instead of running it wrong.
 inline constexpr int kExpertLayoutVersion = 5;
+/// The newest exl3_experts.txt this engine reads.  v1 header:
+///   # strata exl3 experts v1: exl3-k3-mul1-v1 (n_expert 512, n_embd 2560, n_ff 640, K 3, cb 2, blob 1862400)
+/// then one `field <name> <offset> <bytes>` line per tensor (names gate_trellis .. down_svh) and one
+/// `<layer> <offset> <blob> <sha256 of the layer's section>` line per layer, contiguous from offset 0.
+inline constexpr int kExl3LayoutVersion = 1;
 
 }  // namespace strata::kernels::cpu

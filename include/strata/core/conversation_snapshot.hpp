@@ -25,6 +25,12 @@ bool conversation_kv_validate(const ConversationKv& image, const QsaState& state
                               int64_t upto, bool include_index, std::string& error);
 bool conversation_kv_restore(const ConversationKv& image, const QsaState& state, const ModelGeometry& g,
                              int64_t upto, bool include_index, std::string& error);
+// Device-to-device: the first `upto` tokens of `from`'s K/V (+ indexer rows with include_index) into `to`, both
+// layers of the same geometry and storage format with all K/V in VRAM (kv_mode 0).  No host image, and the copies
+// are complete on return (`to` is readable and either state can go the moment this says true); a copy that fails
+// while it runs is this call's false.  False (nothing written) when the layouts differ.
+bool conversation_kv_copy_device(const QsaState& from, const QsaState& to, const ModelGeometry& g,
+                                 int64_t upto, bool include_index, std::string& error);
 // conversation_kv_save(from) + conversation_kv_restore(to) without a host image, for two states of the same layout.
 // The copies are complete on return; the residency refresh is queued on the legacy stream like the restore's.
 // `queued`: the copies are only queued on the private copy stream, the refresh is ordered after them on the device,
@@ -107,6 +113,10 @@ size_t conversation_park_vram_release_all();
 void conversation_park_join_for(const SavedConversation& image);
 bool conversation_checkpoint_restore(const ConversationCheckpoint& checkpoint, SessionState& session,
                                      const ModelGeometry& g, std::string& error);
+// conversation_checkpoint_save(from) + conversation_checkpoint_restore(to) of `ids.size()` tokens without the host
+// image: the running state goes device to device.  Synchronizes before it returns.
+bool conversation_checkpoint_copy_device(const SessionState& from, SessionState& to, const ModelGeometry& g,
+                                         const std::vector<int32_t>& ids, std::string& error);
 // conversation_checkpoint_save(from) + conversation_checkpoint_restore(to) of `ids` without a host image, for two
 // sessions carved alike on the same device; the caller synchronizes the device before (as for the restore).
 // `queued`: the copies are only queued (the private copy stream), and the caller synchronizes the device after too.

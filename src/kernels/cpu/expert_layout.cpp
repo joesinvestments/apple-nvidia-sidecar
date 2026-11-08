@@ -2,6 +2,7 @@
 #include "strata/kernels/cpu/expert_layout.hpp"
 #include "strata/kernels/cpu/hadamard.hpp"
 
+#include <algorithm>
 #include <atomic>
 #include <cstdio>
 #include <cstdlib>
@@ -93,7 +94,8 @@ bool cpu_avx512_ok() {
         const unsigned long long xcr0 = _xgetbv(0);
 #else
         unsigned lo = 0, hi = 0;
-#if !defined(__aarch64__)   // arm64 (the Metal build): no XCR0; cpuid reads zero there, so this is never reached
+        // arm64 (the Metal build): no XCR0; cpuid reads zero there, so this is never reached
+#if !defined(__aarch64__) && (defined(__x86_64__) || defined(_M_X64) || defined(__i386__))
         __asm__ volatile("xgetbv" : "=a"(lo), "=d"(hi) : "c"(0));
 #endif
         const unsigned long long xcr0 = ((unsigned long long) hi << 32) | lo;
@@ -127,7 +129,8 @@ bool cpu_avx512bw_ok() {
         const unsigned long long xcr0 = _xgetbv(0);
 #else
         unsigned lo = 0, hi = 0;
-#if !defined(__aarch64__)   // arm64 (the Metal build): no XCR0; cpuid reads zero there, so this is never reached
+        // arm64 (the Metal build): no XCR0; cpuid reads zero there, so this is never reached
+#if !defined(__aarch64__) && (defined(__x86_64__) || defined(_M_X64) || defined(__i386__))
         __asm__ volatile("xgetbv" : "=a"(lo), "=d"(hi) : "c"(0));
 #endif
         const unsigned long long xcr0 = ((unsigned long long) hi << 32) | lo;
@@ -163,7 +166,8 @@ bool cpu_avx2_ok() {
         const unsigned long long xcr0 = _xgetbv(0);
 #else
         unsigned lo = 0, hi = 0;
-#if !defined(__aarch64__)   // arm64 (the Metal build): no XCR0; cpuid reads zero there, so this is never reached
+        // arm64 (the Metal build): no XCR0; cpuid reads zero there, so this is never reached
+#if !defined(__aarch64__) && (defined(__x86_64__) || defined(_M_X64) || defined(__i386__))
         __asm__ volatile("xgetbv" : "=a"(lo), "=d"(hi) : "c"(0));
 #endif
         const unsigned long long xcr0 = ((unsigned long long) hi << 32) | lo;
@@ -193,7 +197,8 @@ bool cpu_avx1_ok() {
         const unsigned long long xcr0 = _xgetbv(0);
 #else
         unsigned lo = 0, hi = 0;
-#if !defined(__aarch64__)   // arm64 (the Metal build): no XCR0; cpuid reads zero there, so this is never reached
+        // arm64 (the Metal build): no XCR0; cpuid reads zero there, so this is never reached
+#if !defined(__aarch64__) && (defined(__x86_64__) || defined(_M_X64) || defined(__i386__))
         __asm__ volatile("xgetbv" : "=a"(lo), "=d"(hi) : "c"(0));
 #endif
         const unsigned long long xcr0 = ((unsigned long long) hi << 32) | lo;
@@ -432,10 +437,195 @@ void native_gu_rows_invariant(const NativeFmt&, const uint8_t*, const void* cons
 void native_down_rows_invariant(const NativeFmt&, const uint8_t*, const void* const*, int, float* const*, int, int) { std::abort(); }
 #endif
 
+namespace {
+// exl3_experts.txt's tensor names, indexed by Exl3Field (MoeCoopParams order).
+const char* const kExl3FieldName[EXL3_FIELDS] = {"gate_trellis", "gate_suh", "gate_svh",  "up_trellis", "up_suh",
+                                                 "up_svh",       "down_trellis", "down_suh", "down_svh"};
+
+// M4: an EXL3 pack's marker (see kExl3LayoutVersion).  Every number the engine's EXL3 arms rely on is checked here:
+// the one format they implement, the geometry they were built for, each tensor's size from that geometry, 256-byte
+// field alignment (VRAM slot base + offset feeds the GPU pointer tables), no overlap, and every layer present.
+bool load_exl3(std::istream& in, ExpertLayout& L, std::string& err) {
+    const std::string at = "exl3_experts.txt: ";
+    long long n_expert = 0, n_embd = 0, n_ff = 0, k = 0, cb = 0, blob = 0;
+    bool header = false, seen[EXL3_FIELDS] = {};
+    uint64_t fbytes[EXL3_FIELDS] = {};
+    L.offset.assign((size_t) L.n_layers, ~0ull);
+    L.bytes.assign((size_t) L.n_layers, 0);
+    std::string line;
+    while (std::getline(in, line)) {
+        if (line.empty()) continue;
+        if (line[0] == '#') {
+            static const char tag[] = "# strata exl3 experts v";
+            if (line.compare(0, sizeof tag - 1, tag) != 0) continue;
+            L.version = std::atoi(line.c_str() + sizeof tag - 1);
+            if (L.version > kExl3LayoutVersion) {
+                err = at + "v" + std::to_string(L.version) + "; this engine reads up to v" +
+                      std::to_string(kExl3LayoutVersion) + " (a newer pack_exl3.py wrote it)";
+                return false;
+            }
+            char fmt[64] = {};
+            const size_t colon = line.find(": ");
+            if (colon == std::string::npos ||
+                std::sscanf(line.c_str() + colon + 2, "%63s (n_expert %lld, n_embd %lld, n_ff %lld, K %lld, cb %lld, "
+                            "blob %lld)", fmt, &n_expert, &n_embd, &n_ff, &k, &cb, &blob) != 7) {
+                err = at + "a malformed header: " + line;
+                return false;
+            }
+            const std::string want_fmt = "exl3-k" + std::to_string(k) + "-mul1-v1";
+            if (fmt != want_fmt || k < 3 || k > 5) {
+                err = at + "format " + fmt + "; this engine's EXL3 kernels are exl3-k3/k4/k5-mul1-v1 only";
+                return false;
+            }
+            if (n_embd != H || n_ff != FF || cb != 2 || n_expert <= 0 || blob <= 0) {
+                err = at + "geometry " + line.substr(colon + 2) + " is not this model's (n_embd " + std::to_string(H) +
+                      ", n_ff " + std::to_string(FF) + ", K 3/4/5, cb 2)";
+                return false;
+            }
+            L.exl3_k_header = (uint8_t) k;
+            header = true;
+            continue;
+        }
+        if (!header) {
+            err = at + "a line before the '# strata exl3 experts v1' header: " + line;
+            return false;
+        }
+        std::istringstream ss(line);
+        std::string extra;
+        if (line.compare(0, 6, "field ") == 0) {
+            std::string kw, name;
+            unsigned long long off = 0, bytes = 0;
+            if (!(ss >> kw >> name >> off >> bytes) || (ss >> extra)) {
+                err = at + "a malformed field line: " + line;
+                return false;
+            }
+            int f = 0;
+            while (f < EXL3_FIELDS && name != kExl3FieldName[f]) ++f;
+            if (f == EXL3_FIELDS || seen[f]) {
+                err = at + (f == EXL3_FIELDS ? "unknown" : "repeated") + " field " + name;
+                return false;
+            }
+            // trellis: H x FF weights at the header's K bits; suh scales a projection's input, svh its output (gate/up:
+            // H -> FF, down: FF -> H), fp16 each.
+            const uint64_t want = f % 3 == 0 ? (uint64_t) H * FF * (uint64_t) k / 8
+                                             : 2ull * (((f % 3 == 1) == (f < EXL3_D_TRELLIS)) ? H : FF);
+            if (bytes != want || off % 256 != 0 || off + bytes > (uint64_t) blob) {
+                err = at + "field " + name + " at " + std::to_string(off) + " (" + std::to_string(bytes) + " B): wants " +
+                      std::to_string(want) + " B, 256-byte aligned, inside the " + std::to_string(blob) + " B blob";
+                return false;
+            }
+            L.exl3_field_off[f] = (uint32_t) off;
+            fbytes[f] = bytes;
+            seen[f] = true;
+            continue;
+        }
+        if (line.compare(0, 5, "keep ") == 0) {   // keep <layer> <id> ... : the view's expert i is file blob id[i]
+            std::string kw;
+            long long kl = -1;
+            ss >> kw >> kl;
+            if (kl < 0 || kl >= L.n_layers) { err = at + "a malformed keep line: " + line.substr(0, 40); return false; }
+            if (L.remap.empty()) L.remap.resize((size_t) L.n_layers);
+            if (!L.remap[(size_t) kl].empty()) { err = at + "layer " + std::to_string(kl) + " has two keep lines"; return false; }
+            long long id = 0;
+            while (ss >> id) {
+                if (id < 0 || id >= n_expert) { err = at + "keep id " + std::to_string(id) + " outside the file's experts"; return false; }
+                L.remap[(size_t) kl].push_back((uint16_t) id);
+            }
+            continue;
+        }
+        long long l = -1;
+        unsigned long long off = 0, b = 0;
+        std::string sha;
+        if (!(ss >> l >> off >> b >> sha) || (ss >> extra) || l < 0 || l >= L.n_layers || sha.size() != 64) {
+            err = at + "a malformed layer line: " + line;
+            return false;
+        }
+        // mixed precision: a K=3 header's layer blob is the header's (K 3) or the K 2 size (trellises 2/3 as large),
+        // same stride; a K=4/5 header takes only its own blob
+        const uint64_t hk = L.exl3_k_header;
+        const unsigned long long b2 = (unsigned long long) blob - 3ull * ((uint64_t) H * FF * hk / 8ull) +
+                                      3ull * ((uint64_t) H * FF * 2ull / 8ull);
+        const bool full = b == (unsigned long long) blob, smaller = hk == 3 && b == b2;
+        if ((!full && !smaller) || L.offset[(size_t) l] != ~0ull) {
+            err = at + "layer " + std::to_string(l) + (!full && !smaller ? " blob is neither the header's nor its K 2 size"
+                                                                        : " is listed twice");
+            return false;
+        }
+        L.offset[(size_t) l] = off;
+        L.bytes[(size_t) l] = b;
+        if (L.exl3_k.empty()) L.exl3_k.assign((size_t) L.n_layers, (uint8_t) hk);
+        L.exl3_k[(size_t) l] = (uint8_t) (full ? hk : 2);
+    }
+    if (!header) {
+        err = at + "no '# strata exl3 experts v1' header";
+        return false;
+    }
+    int order[EXL3_FIELDS];
+    for (int f = 0; f < EXL3_FIELDS; ++f) {
+        if (!seen[f]) {
+            err = at + "field " + kExl3FieldName[f] + " is missing";
+            return false;
+        }
+        order[f] = f;
+    }
+    std::sort(order, order + EXL3_FIELDS, [&](int a, int b) { return L.exl3_field_off[a] < L.exl3_field_off[b]; });
+    for (int i = 1; i < EXL3_FIELDS; ++i) {
+        const int p = order[i - 1], c = order[i];
+        if (L.exl3_field_off[p] + fbytes[p] > L.exl3_field_off[c]) {
+            err = at + "fields " + kExl3FieldName[p] + " and " + kExl3FieldName[c] + " overlap";
+            return false;
+        }
+    }
+    L.n_expert = n_expert;
+    L.file_n_expert = n_expert;
+    if (!L.remap.empty()) {   // a view: every layer keeps the same number of experts, which the model routes over
+        const size_t nv = L.remap[0].size();
+        for (int64_t l = 0; l < L.n_layers; ++l)
+            if (L.remap[(size_t) l].empty() || L.remap[(size_t) l].size() != nv) {
+                err = at + "keep lines must list every layer with the same expert count (layer " + std::to_string(l) + ")";
+                return false;
+            }
+        L.n_expert = (int64_t) nv;
+    }
+    uint64_t pos = 0;
+    int64_t listed = 0;
+    for (int64_t l = 0; l < L.n_layers; ++l) listed += L.offset[(size_t) l] != ~0ull;
+    for (int64_t l = 0; l < L.n_layers; ++l) {
+        if (L.offset[(size_t) l] != pos) {
+            err = at + "layer " + std::to_string(l) + " is missing or not contiguous (" + std::to_string(listed) +
+                  " of " + std::to_string(L.n_layers) + " layers listed)";
+            return false;
+        }
+        pos += (uint64_t) blob * (uint64_t) n_expert;
+    }
+    L.exl3 = true;
+    L.exl3_stride = (uint64_t) blob;
+    L.max_blob = (uint64_t) blob;
+    L.total = pos;
+    return true;
+}
+}  // namespace
+
 bool expert_layout_load(const std::string& pack_dir, int64_t n_layers, int64_t n_expert, std::string& err) {
     ExpertLayout L;
     L.n_layers = n_layers;
     L.n_expert = n_expert;
+    const auto exists = [&](const char* name) { return std::ifstream(pack_dir + "/" + name).good(); };
+    if (exists("exl3_experts.txt") || exists("exl3_pack.json")) {
+        if (exists("native_experts.txt")) {
+            err = pack_dir + " has both native_experts.txt and an EXL3 marker; one pack holds one expert format";
+            return false;
+        }
+        std::ifstream ex(pack_dir + "/exl3_experts.txt");
+        if (!ex) {
+            err = pack_dir + " has exl3_pack.json but no exl3_experts.txt: the EXL3 pack is still being written "
+                  "(pack_exl3.py writes the marker once every layer is in experts.bin)";
+            return false;
+        }
+        if (!load_exl3(ex, L, err)) return false;
+        g_layout = L;
+        return true;
+    }
     std::ifstream in(pack_dir + "/native_experts.txt");
     if (!in) {
         L.total = (uint64_t) n_layers * (uint64_t) n_expert * (uint64_t) BLOB;

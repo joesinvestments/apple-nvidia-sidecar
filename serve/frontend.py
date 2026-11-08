@@ -706,11 +706,11 @@ def anthropic_to_messages(req: dict, think_unasked: bool = True) -> tuple[list[d
             elif kind == "thinking":
                 reasoning.append(block.get("thinking", ""))
             elif kind == "tool_use":
-                calls.append({"function": {"name": block.get("name"), "arguments": tool_arguments(block.get("input"))}})
+                calls.append({"id": block.get("id"), "_call_id": block.get("id"), "function": {"name": block.get("name"), "arguments": tool_arguments(block.get("input"))}})
             elif kind == "tool_result":
                 # A tool's image (Claude Code's Read of a picture) reaches the encoder like a user's, as the OpenAI
                 # path's tool messages already do; a text-only result is one string, as before.
-                messages.append({"role": "tool", "content": _parts_of(_check_parts(
+                messages.append({"role": "tool", "_call_id": block.get("tool_use_id"), "content": _parts_of(_check_parts(
                     _tool_references(block.get("content"), deferred),
                     f"messages[{i}].content[{j}].content", TEXT_PARTS + IMAGE_PARTS))})
         if text or calls or reasoning or parts:
@@ -746,6 +746,7 @@ def anthropic_to_messages(req: dict, think_unasked: bool = True) -> tuple[list[d
         # A config's reasoning_effort still applies: Service.with_shared sets output_config before this runs.  A
         # request that gives its own reasoning_budget_tokens (#123) asks for thinking, so it thinks as before.
         kwargs["enable_thinking"] = False
+    _order_chat_tool_results(messages)
     return _env_to_user(_late_system_to_user(messages)), tools, kwargs
 
 
@@ -1879,6 +1880,8 @@ class OutputParser:
                 if batch and out[-1].kind == "tool_call":
                     self.state, self.lead = "call", False
 
+    unfinished_calls = 0
+
     def finish(self, reason: str | None = None) -> list[Event]:
         """End of generation: flush whatever is held (an unterminated tool call is returned as content; one that was
         already announced stays unfinished: its JSON is not closed and no "tool_call" follows it, #211).  `reason` is
@@ -1927,6 +1930,10 @@ class OutputParser:
                 out.append(Event("tool_call", call=call))
             elif self.ss == "function_done":
                 out.append(Event("content", self._track(CALL_START + self.buf)))
+            if self.ss not in ("function_done", "done") and self.scall is not None:
+                type(self).unfinished_calls += 1
+                LOGGER.warning("tool_call_unfinished count=%d state=%s reason=%s",
+                               type(self).unfinished_calls, self.ss, reason)
             self.buf = ""
             self._reset_scan()
             return out

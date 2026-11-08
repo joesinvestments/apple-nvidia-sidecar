@@ -289,6 +289,34 @@ size_t conversation_kv_bytes(const QsaState& st, const ModelGeometry& g, int64_t
     return conversation_kv_capture_bytes({}, st, g, upto, index, bytes, error) ? bytes : 0;
 }
 
+bool conversation_kv_copy_device(const QsaState& from, const QsaState& to, const ModelGeometry& g,
+                                 int64_t upto, bool index, std::string& error) {
+    Layout lf{}, lt{};
+    if (!layout(from, g, upto, index, lf, error) || !valid(from, lf, upto, error) ||
+        !layout(to, g, upto, index, lt, error) || !valid(to, lt, upto, error)) return false;
+    if (from.kv_mode != 0 || to.kv_mode != 0 || lf.format != lt.format || lf.page_size != lt.page_size ||
+        lf.data != lt.data || lf.value_data != lt.value_data || lf.scales != lt.scales ||
+        lf.value_scales != lt.value_scales || lf.pooled != lt.pooled) {
+        error = "conversation K/V device copy: the layers' layouts differ";
+        return false;
+    }
+    const auto src = pools(from);
+    const auto dst = pools(to);
+    const std::array<size_t,5> sizes = {lf.data, lf.value_data, lf.scales, lf.value_scales, lf.pooled};
+    for (size_t i = 0; i < sizes.size(); ++i)
+        if (sizes[i] && (!src[i] || !dst[i])) { error = "conversation K/V device copy: missing state buffer"; return false; }
+    for (size_t i = 0; i < sizes.size(); ++i) {
+        if (!sizes[i]) continue;
+        // Default, like `transfer`: device pools go device to device without a host round trip
+        const cudaError_t e = conversation_detail::copy_nonblocking(dst[i], src[i], sizes[i]);
+        if (e != cudaSuccess) {
+            error = std::string("conversation K/V device copy: ") + cudaGetErrorString(e);
+            return false;
+        }
+    }
+    return true;
+}
+
 bool conversation_kv_save(ConversationKv& image, const QsaState& st, const ModelGeometry& g,
                           int64_t upto, bool index, std::string& error,
                           int64_t unchanged_tokens, size_t* reused_bytes) {

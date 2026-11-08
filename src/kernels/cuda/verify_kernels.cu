@@ -13,6 +13,8 @@
 #include "strata/kernels/dp4a.hpp"
 #include "strata/kernels/gfx_arch.hpp"   // #3264: the gfx12 test of the multi-block head ops
 #include "strata/kernels/pdl.hpp"
+#include "strata/xch/xch_layout.h"   // the GPU <-> Metal exchange region (header page + one slot per layer)
+#include "strata/xch/xch_logic.h"    // xch_compact: the layer's cold pairs
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -27,7 +29,11 @@
 #include <vector>
 
 namespace strata::kernels {
-namespace {
+// NVCC and clang give anonymous namespaces different mangled names in the split
+// device/host build. A named TU-local namespace keeps kernel lookups identical.
+namespace verify_detail {}
+using namespace verify_detail;
+namespace verify_detail {
 
 constexpr int S = 128;          // GDN state size
 static_assert(S == strata::core::kCompiledGeometry.ssm_state_size, "verify_kernels is compiled for core/geometry.hpp");
@@ -778,7 +784,7 @@ void ident_hits(const int32_t* ids, int n, int32_t* slot, int32_t* dst, int32_t*
     check("ident_hits");
 }
 
-namespace {
+namespace verify_detail {
 __global__ void copy_row_to_first_kernel(const int32_t* __restrict__ row_dev, float* a, int64_t a_n, float* b,
                                          int64_t b_n, float* c, int64_t c_n) {
     const int64_t row = *row_dev;
@@ -830,7 +836,7 @@ void row_top_prob(const float* logits, int n_rows, int n_vocab, const int32_t* i
 }
 
 #if !defined(STRATA_HIP_GFX906)   // wave32 kernels (CUDA and RDNA HIP; wave64 gfx906 keeps the one-block kernels)
-namespace {
+namespace verify_detail {
 
 #if defined(__HIPCC__)
 constexpr int kArgMaxBlocks = 128, kArgThreads = 256, kTopBlocks = 32;   // RDNA HIP (#3264): single-warp blocks, no block barrier
@@ -983,7 +989,7 @@ void row_top_prob_split(const float* logits, int n_rows, int n_vocab, const int3
 }
 #endif
 
-namespace {
+namespace verify_detail {
 // grid (kNonfiniteBlocks, rows): block b of row t scans [b * per_block, +per_block) and writes its own word.  The
 // test is on the bits (exponent all ones), so --use_fast_math cannot fold it away.
 __global__ void logits_nonfinite_kernel(const float* __restrict__ logits, int n, int per_block, uint32_t* flags) {
@@ -1065,7 +1071,7 @@ bool argmax_rows_wanted() {
 #endif
 }
 
-namespace {
+namespace verify_detail {
 __global__ void window_ids_kernel(int32_t* steps, int window, int32_t* ids, long long stride) {
     const int q = blockIdx.y;
     int32_t* st = steps + q * 4;
@@ -1084,7 +1090,7 @@ void window_ids(int32_t* steps, int n, int window, int32_t* ids, int64_t ids_str
     check("window_ids");
 }
 
-namespace {
+namespace verify_detail {
 // window_ids with a floor read from (mapped) memory when the kernel RUNS: the captured graph keeps the pointer, the
 // value changes between sessions.  A floor of 0 gives window_ids' selection exactly (strata::kernels::window_start).
 __global__ void window_ids_floor_kernel(int32_t* steps, int window, int32_t* ids, long long stride,
@@ -1309,7 +1315,7 @@ void gdn_step_norm_multi(float* state, const float* h, int conv_channels, const 
     check("gdn_step_norm_multi");
 }
 
-namespace {
+namespace verify_detail {
 __global__ void wait_flag_ge_kernel(const volatile uint32_t* flag, uint32_t value) {
     while (*flag < value) strata_spin_pause();
     __threadfence_system();
@@ -1395,7 +1401,7 @@ void handoff_publish(float* dst, const float* a, int64_t na, const float* b, int
     check("handoff_publish");
 }
 
-namespace {
+namespace verify_detail {
 // one thread per window entry: up to kVerifyNarrowT tokens x 10 routed experts (80), so 128 (#646 had 64: a window of
 // 7+ tokens lost its last entries).  A window of 9..16 rows (up to 160 entries) runs the same kernel on 256 threads;
 // one block size per window class, so a narrow window launches exactly the 128-thread kernel it always did.
@@ -1410,7 +1416,7 @@ template <int NT>
 __global__ void __launch_bounds__(NT) resident_plan_kernel(const int32_t* __restrict__ ids, int n, int k, const int32_t* __restrict__ res,
                                      int n_expert, const uint8_t* cache_base, const unsigned long long* slot_off,
                                      long long blob, int32_t* __restrict__ pl, long long capx, uint32_t* skip,
-                                     uint32_t ring, volatile uint32_t* plan_err) {
+                                     uint32_t ring, volatile uint32_t* plan_err, bool allow_cold) {
     constexpr int NW = NT / 32;
     __shared__ int32_t s_ids[NT];
     __shared__ int32_t s_excl[NT];
@@ -1426,10 +1432,10 @@ __global__ void __launch_bounds__(NT) resident_plan_kernel(const int32_t* __rest
         eid = ids[tid];
         s_ids[tid] = eid;
         slot = (eid >= 0 && eid < n_expert) ? res[eid] : -1;
-        if (slot < 0) atomicOr(&s_bad, 1);
+        if (slot < 0 && !allow_cold) atomicOr(&s_bad, 1);
     }
     __syncthreads();
-    if (s_bad) {
+    if (s_bad && !allow_cold) {
         if (tid == 0 && skip != nullptr) *skip = 0;
         if (tid == 0 && skip == nullptr) {   // #871: the all-resident graph has no host plan to fall back on
             pl[0] = 0; pl[1] = 0; pl[2] = 0;   // an empty plan: no expert runs on a stale pointer
@@ -1486,7 +1492,7 @@ __global__ void __launch_bounds__(NT) resident_plan_kernel(const int32_t* __rest
         ptr[grp_idx] = (unsigned long long) (cache_base + (slot_off ? (size_t) slot_off[slot] : (size_t) slot * (size_t) blob));
         start[grp_idx] = ent_start;
     }
-    if (tid < n) {
+    if (tid < n && slot >= 0) {   // a cold entry (allow_cold) is not a group member: no dst entry and no tok
         const int fj_warp = first_j >> 5;
         int fj_tot = s_excl[first_j];
 #pragma unroll
@@ -1506,10 +1512,13 @@ __global__ void __launch_bounds__(NT) resident_plan_kernel(const int32_t* __rest
             for (int w = 0; w < NW; ++w) groups += s_wsum[w];
             groups &= 0xffff;
         }
-        start[groups] = n;
-        start2[0] = n;
+        int packed = 0;
+        for (int w = 0; w < NW; ++w) packed += s_wsum[w];
+        const int entries = allow_cold ? packed >> 16 : n;
+        start[groups] = entries;
+        start2[0] = entries;
         counts[0] = groups;
-        counts[1] = n;
+        counts[1] = entries;
         counts[2] = 0;
         if (skip != nullptr) {
             __threadfence();
@@ -1602,18 +1611,18 @@ __global__ void copy_or_zero_kernel(float4* __restrict__ dst, const volatile flo
 
 void resident_plan(const int32_t* ids, int n_entries, int k, const int32_t* res_layer, int n_expert,
                    const uint8_t* cache_base, const unsigned long long* slot_off, long long blob, int32_t* plan,
-                   long long capx, uint32_t* skip, uint32_t ring, void* stream, uint32_t* plan_err) {
+                   long long capx, uint32_t* skip, uint32_t ring, void* stream, uint32_t* plan_err, bool allow_cold) {
     if (n_entries > kResidentPlanNarrow) {   // a 9..16-row window (kResidentPlanMax == 256 only in a wide build)
         if (kResidentPlanMax > kResidentPlanNarrow && n_entries <= kResidentPlanMax)
             resident_plan_kernel<kResidentPlanMax><<<1, kResidentPlanMax, 0, (cudaStream_t) stream>>>(ids, n_entries, k, res_layer, n_expert, cache_base, slot_off,
-                                                              blob, plan, capx, skip, ring, plan_err);
+                                                              blob, plan, capx, skip, ring, plan_err, allow_cold);
         else {
             std::fprintf(stderr, "resident_plan: %d entries, at most %d\n", n_entries, kResidentPlanMax);
             std::exit(1);
         }
     } else {
         resident_plan_kernel<kResidentPlanNarrow><<<1, kResidentPlanNarrow, 0, (cudaStream_t) stream>>>(ids, n_entries, k, res_layer, n_expert, cache_base, slot_off,
-                                                              blob, plan, capx, skip, ring, plan_err);
+                                                              blob, plan, capx, skip, ring, plan_err, allow_cold);
     }
     check("resident_plan");
 }
@@ -1637,7 +1646,7 @@ void copy_or_zero_from_mapped(float* dst, const float* src, long long n, const u
     check("copy_or_zero_from_mapped");
 }
 
-namespace {
+namespace verify_detail {
 __global__ void wait_copy_i32_kernel(const volatile uint32_t* flag, uint32_t value, int32_t* __restrict__ dst,
                                      const volatile int32_t* src, int n) {
     if (threadIdx.x == 0) {
@@ -1657,6 +1666,121 @@ void wait_copy_i32_from_mapped(const uint32_t* flag, uint32_t value, int32_t* ds
 void wait_flag_ge(const uint32_t* flag, uint32_t value, void* stream) {
     wait_flag_ge_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(flag, value);
     check("wait_flag_ge");
+}
+
+// ---- the GPU <-> Metal exchange (docs/strata-exchange-map.md 3.1, 3.4, 3.5): the 4080's half of one layer's slot in
+// Mac memory (xch_layout.h).  The slot is real Mac DMA memory (tgcuSysmemAlloc), written in place by the card and read
+// by a running Metal kernel, so every payload store is followed by __threadfence_system() and the seq/landed words are
+// volatile.
+namespace verify_detail {
+// the window's epoch, read once from the header page into VRAM: every later compare is against this copy
+__global__ void xch_epoch_load_kernel(const volatile uint32_t* hdr_epoch, uint32_t* d_epoch) {
+    *d_epoch = *hdr_epoch;
+}
+
+// ns from the GPU clock, as gpu_stamp_kernel reads it (also the exchange's publish/wait timestamps)
+__device__ __forceinline__ unsigned long long xch_now_ns() {
+#if defined(STRATA_HIP_GFX906)
+    return wall_clock64() * 40ull;   // gfx906: the wall clock runs at 25 MHz -> ns
+#elif defined(__HIPCC__)
+    return wall_clock64() * 10ull;   // gfx10.3 / gfx11 / gfx12: a constant 100 MHz counter, in ns
+#else
+    unsigned long long t;
+    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
+    return t;
+#endif
+}
+
+// 3.1 step 1: the layer's cold pairs (3.4: d_res alone decides hot vs cold, the same table the EXL3 pre uses), the
+// full ids and x as fp16 (3.5: rot_in_dec converts x to half first, so __float2half_rn publishes the same bits) into
+// the slot, then seq = epoch.  One block: thread 0 compacts, every thread copies.
+struct XchPair {
+    int32_t expert;
+    int32_t row;
+    float weight;
+};
+__global__ void xch_publish_cold_kernel(const float* __restrict__ x, const int32_t* __restrict__ ids,
+                                        const float* __restrict__ w, const int32_t* __restrict__ d_res, int n_expert,
+                                        int n, int k, int N, char* slot, const uint32_t* d_epoch) {
+    __half* const sx = (__half*) (slot + XCH_S_X);
+    int32_t* const sids = (int32_t*) (slot + XCH_S_IDS);
+    for (int i = threadIdx.x; i < n * N; i += blockDim.x) sx[i] = __float2half_rn(x[i]);
+    for (int i = threadIdx.x; i < n * k; i += blockDim.x) sids[i] = ids[i];
+    if (threadIdx.x == 0) {
+        int32_t ex[XCH_MAX_PAIRS], row[XCH_MAX_PAIRS];
+        float wo[XCH_MAX_PAIRS];
+        const int count = xch_compact(ids, w, d_res, n_expert, n, k, ex, row, wo);
+        XchPair* const pairs = (XchPair*) (slot + XCH_S_PAIRS);
+        for (int p = 0; p < count; ++p) {
+            pairs[p].expert = ex[p];
+            pairs[p].row = row[p];
+            pairs[p].weight = wo[p];
+        }
+        *(volatile uint32_t*) (slot + XCH_S_COUNT) = (uint32_t) count;
+        *(volatile uint32_t*) (slot + XCH_S_NROWS) = (uint32_t) n;
+    }
+    __threadfence_system();
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        *(volatile unsigned long long*) (slot + XCH_S_NV_PUB_NS) = xch_now_ns();
+        *(volatile uint32_t*) (slot + XCH_S_SEQ) = *d_epoch;
+        __threadfence_system();
+    }
+}
+
+// 3.1 step 5: the bounded system-scope wait for Metal's landed word (the xch_wait_ge pattern, exchange/xch.cu:54-66),
+// the abort word checked every spin.  On timeout or abort it writes the status and returns, so the graph drains: plain
+// stores, nv_status is Mac memory and PCIe atomics through the link are unverified.
+__global__ void xch_wait_flag_sys_kernel(const volatile uint32_t* landed, const uint32_t* d_epoch,
+                                         const volatile uint32_t* abort_word, uint32_t* nv_status, uint32_t layer,
+                                         uint32_t timeout_us) {
+    const uint32_t want = *d_epoch;
+    char* const slot = (char*) landed - XCH_S_LANDED;
+    const unsigned long long deadline = xch_now_ns() + (unsigned long long) timeout_us * 1000ull;
+    *(volatile unsigned long long*) (slot + XCH_S_NV_WAIT0_NS) = xch_now_ns();
+    uint32_t spins = 0;
+    while ((int32_t) (*landed - want) < 0) {
+        if (*abort_word != 0u) {
+            nv_status[0] = XCH_ST_ABORT;
+            nv_status[1] = layer;
+            nv_status[2] = spins;
+            return;
+        }
+        if (xch_now_ns() >= deadline) {
+            nv_status[0] = XCH_ST_TIMEOUT;
+            nv_status[1] = layer;
+            nv_status[2] = spins;
+            return;
+        }
+        ++spins;
+    }
+    *(volatile unsigned long long*) (slot + XCH_S_NV_WAIT1_NS) = xch_now_ns();
+    *(volatile uint32_t*) (slot + XCH_S_NV_SPINS) = spins;
+    __threadfence_system();
+}
+}  // namespace
+
+void xch_epoch_load(const uint32_t* hdr_epoch, uint32_t* d_epoch, void* stream) {
+    xch_epoch_load_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(hdr_epoch, d_epoch);
+    check("xch_epoch_load");
+}
+
+void xch_publish_cold(const float* x, const int32_t* ids, const float* w, const int32_t* d_res, int n_expert, int n,
+                      int k, int N, void* slot, const uint32_t* d_epoch, void* stream) {
+    if (n < 0 || n > (int) XCH_MAX_ROWS || k < 0 || n * k > (int) XCH_MAX_PAIRS || N < 0 || N > (int) XCH_H) {
+        std::fprintf(stderr, "xch_publish_cold: shape out of range (n %d, k %d, N %d)\n", n, k, N);
+        std::exit(1);
+    }
+    xch_publish_cold_kernel<<<1, 1024, 0, (cudaStream_t) stream>>>(x, ids, w, d_res, n_expert, n, k, N, (char*) slot,
+                                                                  d_epoch);
+    check("xch_publish_cold");
+}
+
+void xch_wait_flag_sys(const uint32_t* landed, const uint32_t* d_epoch, const uint32_t* abort_word, uint32_t* nv_status,
+                       uint32_t layer, uint32_t timeout_us, void* stream) {
+    xch_wait_flag_sys_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(landed, d_epoch, abort_word, nv_status, layer,
+                                                                 timeout_us);
+    check("xch_wait_flag_sys");
 }
 
 void wait_flag_ge_stamped(const uint32_t* flag, uint32_t value, unsigned long long* t_in, unsigned long long* t_out,
@@ -1698,7 +1822,7 @@ void copy_indexed(float* dst, const float* src, int64_t stride, const int32_t* i
 
 // a GPU timestamp (ns, %globaltimer) into buf[i] - the verify window's stage profiler.  Pdl: launched inside a PDL
 // stretch, the stamp lets the next kernel launch at once and takes its time when the one before it has finished.
-namespace {
+namespace verify_detail {
 template <bool Pdl>
 __global__ void gpu_stamp_kernel(unsigned long long* buf, int i) {
     if constexpr (Pdl) {
@@ -1716,7 +1840,7 @@ __global__ void gpu_stamp_kernel(unsigned long long* buf, int i) {
     buf[i] = t;
 }
 }  // namespace
-namespace {
+namespace verify_detail {
 __global__ void noop_kernel() {}
 }  // namespace
 void gpu_noop(void* stream) { noop_kernel<<<1, 32, 0, (cudaStream_t) stream>>>(); }
@@ -1725,7 +1849,7 @@ void gpu_stamp(unsigned long long* buf, int i, void* stream) {
     else gpu_stamp_kernel<false><<<1, 1, 0, (cudaStream_t) stream>>>(buf, i);
 }
 
-namespace {
+namespace verify_detail {
 __global__ void copy_rows_strided_kernel(float4* __restrict__ dst, const float4* __restrict__ src, long long rows,
                                          int w4, int src_w4) {
     const long long total = rows * w4;

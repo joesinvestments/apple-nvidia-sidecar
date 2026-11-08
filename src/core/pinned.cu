@@ -37,7 +37,9 @@
 #include <sys/vfs.h>
 #endif
 #include <unistd.h>
+#if defined(__linux__)
 #include <linux/mman.h>
+#endif
 #ifndef MAP_HUGE_2MB
 #define MAP_HUGE_2MB (21 << 26)
 #endif
@@ -429,6 +431,12 @@ void* reserve(uint64_t bytes, PageBacking& got, std::string& note, const std::st
         return (uint8_t*) map + kSharedArenaHeaderBytes;
     }
 
+#ifndef __linux__
+    // Linux hugetlb and THP are not available on macOS.
+    void* p = mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    got = PageBacking::NormalPages;
+    return p == MAP_FAILED ? nullptr : p;
+#else
     // STRATA_NO_LARGEPAGES=1 is the same-run A/B switch the Windows branch documents; honor it
     // here too, so the large-page path can be compared without changing the pool or rebooting.
     if (std::getenv("STRATA_NO_LARGEPAGES") != nullptr) {
@@ -510,6 +518,7 @@ void* reserve(uint64_t bytes, PageBacking& got, std::string& note, const std::st
         note += "; transparent huge pages requested (MADV_HUGEPAGE)";
     }
     return p;
+#endif  // __linux__
 #endif
 }
 

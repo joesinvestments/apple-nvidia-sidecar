@@ -389,6 +389,47 @@ bool conversation_checkpoint_save(ConversationCheckpoint& c, const SessionState&
     return checkpoint_save(c, ss, g, error, staged);
 }
 
+namespace {
+bool copy_async(void* dst, const void* src, size_t bytes, std::string& error) {
+    if (!bytes) return true;
+    if (!dst || !src) return fail(error, "missing running-state buffer");
+    // Default: device allocations go device to device (queued, no host round trip); a mapped host buffer
+    // takes the same path conversation_checkpoint_save would.
+    const auto status = cudaMemcpyAsync(dst, src, bytes, cudaMemcpyDefault, nullptr);
+    if (status == cudaSuccess) return true;
+    error = std::string("conversation running-state device copy: ") + cudaGetErrorString(status);
+    return false;
+}
+} // namespace
+
+bool conversation_checkpoint_copy_device(const SessionState& from, SessionState& to, const ModelGeometry& g,
+                                         const std::vector<int32_t>& ids, std::string& error) {
+    ConversationStateSizes zf, zt;
+    if (!checkpoint_targets(from, g, ids.size(), zf, error) || !checkpoint_targets(to, g, ids.size(), zt, error))
+        return false;
+    const size_t layers = owned_qsa(from);
+    if (layers != owned_qsa(to) || zf.gdn != zt.gdn || zf.tail != zt.tail || zf.dead != zt.dead ||
+        zf.block_pos != zt.block_pos || (from.ple_hist ? zf.ple : 0) != (to.ple_hist ? zt.ple : 0))
+        return fail(error, "conversation running-state device copy: the sessions' carves differ");
+    if (!copy_async(to.gdn_state, from.gdn_state, zf.gdn, error) ||
+        !copy_async(to.ple_hist, from.ple_hist, from.ple_hist ? zf.ple : 0, error)) return false;
+    for (size_t j = 0; j < layers; ++j) {
+        const auto& s = owned(from, j);
+        const auto& d = owned(to, j);
+        if (!copy_async(d.idx_tail, s.idx_tail, zf.tail, error) ||
+            !copy_async(d.idx_dead, s.idx_dead, zf.dead, error) ||
+            !copy_async(d.idx_block_pos, s.idx_block_pos, zf.block_pos, error)) return false;
+        if (!ids.empty()) {
+            const size_t row = ids.size() / strata::kernels::qsa_real_shapes().idx_block;
+            if (!copy_async(d.idx_pooled + row * g.idx_key_dim, s.idx_dead, zf.dead, error)) return false;
+        }
+    }
+    const size_t tokens = ids.size();
+    to.ple_prev[0] = tokens >= 2 ? ids[tokens - 2] : -1;
+    to.ple_prev[1] = tokens >= 1 ? ids[tokens - 1] : -1;
+    return sync(error);
+}
+
 bool conversation_checkpoint_restore(const ConversationCheckpoint& c, SessionState& ss,
                                      const ModelGeometry& g, std::string& error) {
     const VramSlot* hit = nullptr;

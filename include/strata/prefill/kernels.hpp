@@ -122,7 +122,7 @@ void moe_scatter_add(const float* Dm, const int32_t* u_tok, const int32_t* u_off
 /// D[slot[t, k], :], in k order) + peer[t, :] + shared[t, :] * sigmoid(sg[t]).  `peer` (the peer's per-token sums)
 /// may be mapped host memory.
 void moe_combine_peer(const float* D, const int32_t* slot, const float* w, const float* shared, const float* sg,
-                      const float* peer, int64_t rows_local, float* bo, int64_t T, void* stream);
+                      const float* peer, int64_t rows_local, float* bo, int64_t T, void* stream, const float* row_sd = nullptr);   // row_sd: as moe_combine
 /// sum[t, :] += wk[p] * rows[r, :] with p = pair[r], t = p / 10 (the routed pair's token), for n rows of ONE expert
 /// (no token twice: launches in a fixed expert order make the sums repeatable).  After eddoursul/Strata's
 /// moe_scatter_add (f8de703).
@@ -134,11 +134,15 @@ void peer_gather_add(float* sum, const float* rows, int64_t r0, const float* wk,
                      const int32_t* start, const int32_t* list, int64_t n_tok, void* stream);
 /// moe_combine_peer with the peer's sums in FP16 (`peer16`, may be mapped host memory)
 void moe_combine_peer16(const float* D, const int32_t* slot, const float* w, const float* shared, const float* sg,
-                        const uint16_t* peer16, int64_t rows_local, float* bo, int64_t T, void* stream);
+                        const uint16_t* peer16, int64_t rows_local, float* bo, int64_t T, void* stream, const float* row_sd = nullptr);
 /// y = FP16 bits of x, saturated at +-65504 (the peer's sums on their way back; eddoursul/Strata 2acfac4)
 void sums_to_f16(const float* x, uint16_t* y, int64_t n, void* stream);
 /// dst[0, n) = FP32 of the FP16 src[0, n) (n a multiple of 8, 16-byte aligned; src may be mapped host memory)
 void f16_to_f32_wide(float* dst, const uint16_t* src, int64_t n, void* stream);
+/// STRATA_PF_XPORT8 (include/strata/prefill/xport8.hpp): out[0, xport8::packed_bytes(n)) = int8 block-32 form of the fp16 x16[0, n) (n a multiple of 32; out 2-byte aligned)
+void xport8_quant(const uint16_t* x16, uint8_t* out, int64_t n, void* stream);
+/// out16[0, n) = fp16 of the packed form in[0, packed_bytes(n)) (clamped to +-65504)
+void xport8_dequant(const uint8_t* in, uint16_t* out16, int64_t n, void* stream);
 
 // ---- QSA helpers
 /// In place: x[r, :] = x[r, :] * rsqrt(mean x^2 + eps) * w  over rows of `cols` (row stride `ld`).

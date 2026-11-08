@@ -28,6 +28,7 @@
 #pragma once
 
 #include "strata/kernels/cpu/expert.hpp"
+#include "strata/kernels/cpu/expert_layout.hpp"
 #include "strata/kernels/cpu/native_expert.hpp"
 #include "strata/kernels/cpu/pool_plan.hpp"
 
@@ -249,6 +250,10 @@ public:
     /// Plan v0.3 P6: the same for a native pack's layer (ggml-cpu arithmetic, `nact` activations).
     void run_split_multi_native(const NativeFmt& f, ExpertJobMulti* jobs, int n,
                                 NativeArithmetic arithmetic = NativeArithmetic::Default);
+    /// M4: the same for an EXL3 pack's layer (libexl3cpu NEON, dlopen'd).  `nact[t]` is token t's FP32 MoE input
+    /// (H floats); outputs are FP32 rows, unweighted, like the other arms.  Each expert's projections are split into
+    /// 128-column blocks across every thread.  Returns false (and sets `err`) when the library is missing.
+    bool run_split_multi_exl3(const ExpertLayout& lay, int64_t layer, ExpertJobMulti* jobs, int n, const char*& err);
     static constexpr int kMaxSplitMulti = 96;
     /// run_split_multi's phases, accumulated ms: gate/up rows, the intermediate quantization, down rows.
     double ms_multi_gu = 0, ms_multi_q = 0, ms_multi_down = 0;
@@ -290,6 +295,7 @@ private:
     void worker(int id);
     void drain(int id, ExpertScratch& scratch, uint32_t epoch);
     void run_phase(int mode, int n_tasks);
+    void exl3_task(int i);
     /// Claim the next job of batch `epoch`, or -1 (that batch is exhausted, or it is not the current one).
     int claim(uint32_t epoch);
     /// Publish the batch whose description the caller has just written: reset `done`, then `head`, then the epoch.
@@ -369,6 +375,19 @@ private:
     const NativeFmt* nfmt_ = nullptr;
     NativeArithmetic narithmetic_ = NativeArithmetic::Default;
     std::vector<SplitBufMulti> split_multi_;
+    // M4 EXL3 arm: modes 7 (input rotation + xq, tasks = expert x {gate, up}), 8 (gate/up 128-column blocks),
+    // 9 (SwiGLU + down rotation + xq, tasks = experts), 10 (down 128-column blocks, kExl3DownPer per task)
+    struct Exl3Buf {
+        alignas(64) uint16_t xq[2][MAXT * H * 2];     // permuted inputs: [0] gate or down, [1] up
+        alignas(64) float g[MAXT * FF], u[MAXT * FF];
+        alignas(64) uint16_t z[MAXT * FF], zh[MAXT * FF];
+        alignas(64) float d[MAXT * H];
+    };
+    std::vector<Exl3Buf> exl3_buf_;
+    const ExpertLayout* xlay_ = nullptr;
+    uint32_t xoff_[EXL3_FIELDS] = {};   // the current layer's blob field offsets
+    int xbits_ = 3;
+    static constexpr int kExl3DownPer = 2;
     // STRATA_NUMA_SPLIT=1 (opt-in, Linux, exactly 2 nodes): in the native row phases (modes 5/6) every expert's rows
     // are cut into one slice per NUMA node (slice k = rows [per*k/2, per*(k+1)/2) of the gate/up or down matrix, the
     // part the resident complement places on node k in step B), and each node's threads claim and count on their own

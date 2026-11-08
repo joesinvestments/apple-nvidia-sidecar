@@ -99,6 +99,17 @@ void wait_handoff(const uint32_t* flag, uint32_t value, uint32_t* err, unsigned 
 /// into *t_out (either may be null): the verify window's PCIe-share balance, at no extra launch.
 void wait_flag_ge_stamped(const uint32_t* flag, uint32_t value, unsigned long long* t_in, unsigned long long* t_out,
                           void* stream);
+/// The GPU <-> Metal exchange (docs/strata-exchange-map.md 3.1, 3.4, 3.5): the 4080's half of one layer's slot in Mac
+/// memory (xch_layout.h).  xch_epoch_load copies the window's epoch from the header page into VRAM, once per window.
+void xch_epoch_load(const uint32_t* hdr_epoch, uint32_t* d_epoch, void* stream);
+/// Publish layer `slot`: its cold pairs (d_res alone decides hot vs cold, 3.4), the full ids and x as fp16 (3.5), then
+/// seq = epoch.  n <= XCH_MAX_ROWS, n*k <= XCH_MAX_PAIRS, N <= XCH_H.
+void xch_publish_cold(const float* x, const int32_t* ids, const float* w, const int32_t* d_res, int n_expert, int n,
+                      int k, int N, void* slot, const uint32_t* d_epoch, void* stream);
+/// Bounded wait for the slot's landed word (the epoch from d_epoch), the abort word checked every spin; on timeout or
+/// abort nv_status = {XCH_ST_TIMEOUT or XCH_ST_ABORT, layer, spins} and the kernel returns.
+void xch_wait_flag_sys(const uint32_t* landed, const uint32_t* d_epoch, const uint32_t* abort_word, uint32_t* nv_status,
+                       uint32_t layer, uint32_t timeout_us, void* stream);
 /// the GPU's %globaltimer (ns) into buf[i] (a one-thread kernel: the verify window's stage profiler).  Inside a PDL
 /// stretch (pdl.hpp) the stamp passes the early launch on, so a profiled window keeps the chain it measures.
 void gpu_stamp(unsigned long long* buf, int i, void* stream);
@@ -115,9 +126,13 @@ void copy_rows_strided(float* dst, const float* src, int64_t rows, int64_t w, in
 /// routing order, their entries ascending), no PCIe groups.  *skip = ring when it did, else 0.
 /// #871: without `skip` (the all-resident graph) an entry whose expert is not in VRAM cannot be planned: the plan is
 /// left empty and *plan_err (mapped host memory) is set to 1, so the host sees it instead of running a stale plan.
+/// `allow_cold` (the exchange's native arm, strata-051/include/strata/xch/xch_native.h): a cold entry (slot < 0) is not
+/// a group member and gets no entry - the counts, start2[0] and the plan's end cover the resident pairs only, the
+/// positions stay global (t * k + j) and *plan_err is left as it is.  False: the strict plan above.
 void resident_plan(const int32_t* ids, int n_entries, int k, const int32_t* res_layer, int n_expert,
                    const uint8_t* cache_base, const unsigned long long* slot_off, long long blob, int32_t* plan,
-                   long long capx, uint32_t* skip, uint32_t ring, void* stream, uint32_t* plan_err = nullptr);
+                   long long capx, uint32_t* skip, uint32_t ring, void* stream, uint32_t* plan_err = nullptr,
+                   bool allow_cold = false);
 /// wait_flag_ge that also returns when *skip == value (device memory).
 void wait_flag_ge_or(const uint32_t* flag, uint32_t value, const uint32_t* skip, void* stream);
 /// copy_i32_from_mapped unless *skip == value.

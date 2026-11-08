@@ -313,6 +313,9 @@ bool DirectFile::open(const std::string& path, std::string& err) {
     impl_->fd = ::open(path.c_str(), O_RDONLY | O_DIRECT);
 #endif
     if (impl_->fd < 0) { err = "DirectFile: cannot open " + path; return false; }
+#if defined(STRATA_MACOS_NOCACHE)
+    (void) fcntl(impl_->fd, F_NOCACHE, 1);   // macOS: uncached reads, the O_DIRECT equivalent
+#endif
     struct stat st;
     if (fstat(impl_->fd, &st) != 0) { err = "DirectFile: cannot size " + path; close(); return false; }
     impl_->size = (uint64_t) st.st_size;

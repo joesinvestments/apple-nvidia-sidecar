@@ -4,6 +4,8 @@
 #include "strata/platform/aux_cpus.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
 #include "strata/kernels/cpu/numa_pool.hpp"
+#include <dlfcn.h>
+#include <string>
 
 #include <algorithm>
 #include <atomic>
@@ -27,11 +29,51 @@
 #include "pool_affinity_win.hpp"
 #else
 #include <pthread.h>
+#if defined(__APPLE__)
+#include <pthread/qos.h>
+#endif
 #include <sched.h>
 #include <unistd.h>
-#include "pool_affinity_linux.hpp"
+#include "pool_affinity_linux.hpp"   // also the macOS no-op affinity (0.1.51's own __APPLE__ arm: no pinning there)
 #endif
 
+namespace strata::kernels::cpu {
+namespace {
+constexpr int kStatThreads = 16;
+struct PhaseStat { double wall = 0, park = 0, drain = 0, donew = 0, repark = 0; int64_t n = 0, tasks = 0; };
+struct WStat { double wake_ms = 0, busy_ms = 0; int64_t wake_n = 0, claims = 0; };
+// STRATA_POOL_STATS=1: the EXL3 arm's per-phase wall split, workers' wake latency and busy time (diagnostic only)
+struct PoolStats { bool on = false; int64_t calls = 0; PhaseStat pst[4]; std::atomic<int64_t> pub_ns{0}; WStat wst[kStatThreads];
+                   double call_ms = 0, memcpy_ms = 0, expert_n = 0; } g_st;
+// STRATA_POOL_CALL_SPIN_US=N: workers spin N us (instead of sleeping on the condition variable at once) between the phases of ONE
+// EXL3 pool call, so a layer pays one wake-up instead of four; they sleep again (spin 0) as soon as the call returns.
+static std::atomic<int64_t> g_call_spin_ns{-1};   // -1: the pool's own spin_before_sleep_
+static int64_t g_call_spin_cfg_ns = -1;           // the knob's value, ns (-1: off)
+static bool g_pool_qos = false;                   // STRATA_POOL_QOS=1: user-interactive QoS (P-cores first) on workers
+static void stats_print() {
+    const double calls = (double) g_st.calls;
+    std::fprintf(stderr, "strata pool stats (%lld calls, %.2f experts/call, %.3f ms/call incl memcpy %.3f):\n", (long long) g_st.calls,
+                 g_st.expert_n / calls, g_st.call_ms / calls, g_st.memcpy_ms / calls);
+    static const char* nm[4] = {"rot/xq(7)", "gu(8)", "swiglu(9)", "down(10)"};
+    for (int m = 0; m < 4; ++m) {
+        const PhaseStat& s = g_st.pst[m];
+        const double n = (double) std::max<int64_t>(1, s.n);
+        std::fprintf(stderr, "  %-10s wall %.3f = park-wait %.3f + host-drain %.3f + done-wait %.3f + repark %.3f ms/call (%.1f tasks)\n", nm[m], s.wall / n,
+                     s.park / n, s.drain / n, s.donew / n, s.repark / n, (double) s.tasks / n);
+    }
+    std::fprintf(stderr, "  threads (wake ms avg publish->first claim | claims/call | busy ms/call):");
+    for (int i = 0; i < kStatThreads; ++i) {
+        const WStat& w = g_st.wst[i];
+        if (w.claims == 0 && w.wake_n == 0) continue;
+        std::fprintf(stderr, " %s%d[%.3f|%.1f|%.3f]", i == kStatThreads - 1 ? "H" : "w", i == kStatThreads - 1 ? 0 : i,
+                     w.wake_n ? w.wake_ms / (double) w.wake_n : 0.0, (double) w.claims / calls, w.busy_ms / calls);
+    }
+    std::fprintf(stderr, "\n");
+    std::fflush(stderr);
+}
+
+}  // namespace
+}  // namespace strata::kernels::cpu
 namespace strata::kernels::cpu {
 
 namespace {
@@ -745,6 +787,9 @@ ExpertPool::ExpertPool(int n_workers, bool pin, bool host_works, PoolAffinity af
     if (tasks < 0 || tasks > kMaxTasks) throw std::invalid_argument("expert pool tasks must be in 0..4096");
     pinned_ = pin;
     layout_ = logical_cpu_layout();   // now, before anything pins the caller (Linux reads the calling thread's allowed CPUs)
+    g_st.on = std::getenv("STRATA_POOL_STATS") != nullptr;
+    if (const char* e = std::getenv("STRATA_POOL_CALL_SPIN_US")) g_call_spin_cfg_ns = (int64_t) std::atoi(e) * 1000;
+    g_pool_qos = std::getenv("STRATA_POOL_QOS") != nullptr && std::atoi(std::getenv("STRATA_POOL_QOS")) != 0;
     if (const char* e = std::getenv("STRATA_POOL_SPIN_US"))   // a test knob; see kSpinBeforeSleep
         spin_before_sleep_ = std::chrono::microseconds((std::max)(0, std::atoi(e)));
     // STRATA_NUMA_SPLIT, read here for the worker count (the split itself is decided below, once the count is known).
@@ -925,6 +970,9 @@ ExpertPool::ExpertPool(int n_workers, bool pin, bool host_works, PoolAffinity af
         const int core = pin ? (i < (int) topo_.worker_cores.size() ? topo_.worker_cores[(size_t) i] : -1) : -1;
         threads_.emplace_back([this, i, core] {
             strata::platform::name_this_thread("strata-pool", i);
+#if defined(__APPLE__)
+            if (g_pool_qos) pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+#endif
             strata::aux_cpus::note_owned_thread();   // --aux-cpus never moves a worker
             // a failed pin only costs locality under the split: the worker keeps the slice it was given
             if (!pin_this_thread(core, i) && core >= 0 && numa_n_ > 0)
@@ -1013,7 +1061,12 @@ void ExpertPool::worker(int id) {
                 strata_cpu_pause();
                 if ((++spins & 1023u) != 0) continue;
             }
-            if (std::chrono::steady_clock::now() - parked_at < spin_before_sleep_) continue;
+            {
+                const int64_t cs = g_call_spin_ns.load(std::memory_order_relaxed);
+                const auto lim = cs >= 0 ? std::chrono::nanoseconds(cs)
+                                         : std::chrono::duration_cast<std::chrono::nanoseconds>(spin_before_sleep_);
+                if (std::chrono::steady_clock::now() - parked_at < lim) continue;
+            }
             std::unique_lock<std::mutex> lk(sleep_mu_);
             wstate_[(size_t) id].store(kSleeping, std::memory_order_relaxed);
             sleepers_.fetch_add(1, std::memory_order_seq_cst);
@@ -1107,6 +1160,7 @@ uint32_t ExpertPool::begin_batch(int n) {
     // Every job of the previous batch has completed (`wait_done`), and a claim of it can no longer succeed, so
     // nothing adds to `done` until this batch's first claim - which the release below orders after the reset.
     const uint32_t e = epoch_.load(std::memory_order_relaxed) + 1;   // only the host bumps the epoch
+    if (g_st.on) g_st.pub_ns.store(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count(), std::memory_order_relaxed);
     if (numa_phase()) {
         // every slice's head, even a slice with no task, and never `head_`: for this epoch only the slice heads
         // carry `e`, so a claim on `head_` fails, and every head left from an earlier batch is exhausted (pool.hpp)
@@ -1174,6 +1228,7 @@ void ExpertPool::wait_done(int n) {
 }
 
 void ExpertPool::drain(int id, ExpertScratch& scratch, uint32_t epoch) {
+    bool first_claim = true;
     const int s = numa_n_ == 0 ? 0 : id >= 0 ? wslice_[(size_t) id] : hslice_;
     for (;;) {
         // STRATA_NUMA_SPLIT: a mode-5/6 batch lives on the slice heads, any other on `head_`; the epoch tag makes the
@@ -1182,6 +1237,18 @@ void ExpertPool::drain(int id, ExpertScratch& scratch, uint32_t epoch) {
         const bool sliced = ci >= 0;
         if (!sliced) ci = claim(epoch);
         if (ci < 0) break;
+        std::chrono::steady_clock::time_point st_t0;
+        if (g_st.on) {
+            st_t0 = std::chrono::steady_clock::now();
+            WStat& w = g_st.wst[id >= 0 ? (id < kStatThreads - 1 ? id : kStatThreads - 2) : kStatThreads - 1];
+            if (first_claim) {
+                const int64_t now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(st_t0.time_since_epoch()).count();
+                w.wake_ms += (double) (now_ns - g_st.pub_ns.load(std::memory_order_relaxed)) * 1e-6;
+                ++w.wake_n;
+                first_claim = false;
+            }
+            ++w.claims;
+        }
         const uint32_t i = (uint32_t) ci;
         if (id >= 0) wstate_[(size_t) id].store(ci, std::memory_order_relaxed);
         else { hstate_.store(ci, std::memory_order_relaxed); hstate_ms_.store(now_ms(), std::memory_order_relaxed); }
@@ -1196,6 +1263,8 @@ void ExpertPool::drain(int id, ExpertScratch& scratch, uint32_t epoch) {
             const int e = (int) i / parts_b_, part = (int) i % parts_b_;
             const int r0 = H * part / parts_b_, r1 = H * (part + 1) / parts_b_;
             s2_expert_down_rows(jobs_[e].blob, split_[(size_t) e].a2, jobs_[e].out, r0, r1);
+        } else if (mode_ >= 7) {
+            exl3_task((int) i);
         } else if (mode_ >= 5) {
             // plan v0.3 P6: native layers, 5 = gate/up rows, 6 = down rows (the layer's own n_ff / n_embd: Flash-Next's
             // FF / H, or another family's smaller expert)
@@ -1271,6 +1340,9 @@ void ExpertPool::drain(int id, ExpertScratch& scratch, uint32_t epoch) {
                 r += r1 - r0;
             }
         }
+        if (g_st.on)
+            g_st.wst[id >= 0 ? (id < kStatThreads - 1 ? id : kStatThreads - 2) : kStatThreads - 1].busy_ms +=
+                std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - st_t0).count();
         if (sliced) {
             NodeSync& ns = nsync_[(size_t) s];
             const uint32_t t = (uint32_t) ns.tasks;
@@ -1284,12 +1356,25 @@ void ExpertPool::drain(int id, ExpertScratch& scratch, uint32_t epoch) {
 }
 
 void ExpertPool::run_phase(int mode, int n_tasks) {
+    const auto p0 = std::chrono::steady_clock::now();
     wait_parked("before a phase");
+    const auto p1 = std::chrono::steady_clock::now();
     mode_ = mode;
     njobs_ = n_tasks;
     const uint32_t e = begin_batch(n_tasks);
     if (host_works_) drain(-1, host_scratch_, e);
+    const auto p2 = std::chrono::steady_clock::now();
     wait_done(n_tasks);
+    if (g_st.on && mode >= 7) {
+        const auto p3 = std::chrono::steady_clock::now();
+        PhaseStat& s = g_st.pst[mode - 7];
+        s.park += std::chrono::duration<double, std::milli>(p1 - p0).count();
+        s.drain += std::chrono::duration<double, std::milli>(p2 - p1).count();
+        s.donew += std::chrono::duration<double, std::milli>(p3 - p2).count();
+        s.wall += std::chrono::duration<double, std::milli>(p3 - p0).count();
+        ++s.n; s.tasks += n_tasks;
+    }
+    const auto p4 = std::chrono::steady_clock::now();
     wait_parked("after a phase");
     // Each slice's stamp is stored after its last `done` increment, so `wait_done` can return before it lands; the
     // thread that stored it has parked again since (it left the park to claim), and that re-park is what the wait
@@ -1301,6 +1386,11 @@ void ExpertPool::run_phase(int mode, int n_tasks) {
         }
     hstate_.store(kIdle, std::memory_order_relaxed);
     hstate_ms_.store(now_ms(), std::memory_order_relaxed);
+    if (g_st.on && mode >= 7) {
+        PhaseStat& s = g_st.pst[mode - 7];
+        const double rp = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - p4).count();
+        s.repark += rp; s.wall += rp;
+    }
 }
 
 void ExpertPool::run_split(ExpertJob* jobs, int n) {
@@ -1392,6 +1482,121 @@ void ExpertPool::run_split_multi_native(const NativeFmt& f, ExpertJobMulti* jobs
     multi_bytes += (int64_t) n * (int64_t) f.bytes;
     mode_ = 0;
     ms_drain_ += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+}
+
+
+// ---------------------------------------------------------------- M4: EXL3 CPU arm
+namespace {
+struct Exl3Lib {
+    void (*had_in)(const uint16_t*, const uint16_t*, int, int, uint16_t*) = nullptr;
+    void (*prep_xq)(const uint16_t*, int, int, uint16_t*) = nullptr;
+    int (*gemv_blocks)(const uint16_t*, const uint16_t*, const uint16_t*, int, int, int, int, int, int, int, float*,
+                       float*) = nullptr;
+    bool ok = false;
+    std::string err;
+};
+const Exl3Lib& exl3_lib() {
+    static const Exl3Lib L = [] {
+        Exl3Lib l;
+        const char* e = std::getenv("STRATA_EXL3_CPU_LIB");
+        const char* home = std::getenv("HOME");
+        const std::string path = e ? e : std::string(home ? home : "") + "/exl3/cpu/libexl3cpu.dylib";
+        void* h = dlopen(path.c_str(), RTLD_NOW | RTLD_LOCAL);
+        if (!h) { l.err = "dlopen " + path + ": " + dlerror(); return l; }
+        l.had_in = (decltype(l.had_in)) dlsym(h, "exl3_cpu_had_in");
+        l.prep_xq = (decltype(l.prep_xq)) dlsym(h, "exl3_cpu_prep_xq");
+        l.gemv_blocks = (decltype(l.gemv_blocks)) dlsym(h, "exl3_cpu_gemv_blocks");
+        l.ok = l.had_in && l.prep_xq && l.gemv_blocks;
+        if (!l.ok) l.err = path + " lacks exl3_cpu_had_in / exl3_cpu_prep_xq / exl3_cpu_gemv_blocks";
+        return l;
+    }();
+    return L;
+}
+inline uint16_t f2h(float v) { _Float16 h = (_Float16) v; uint16_t u; std::memcpy(&u, &h, 2); return u; }
+constexpr int kExl3Cb = 2;   // MUL1 (bits per layer: ExpertLayout::exl3_bits)
+}  // namespace
+
+void ExpertPool::exl3_task(int i) {
+    const Exl3Lib& X = exl3_lib();
+    const uint32_t* off = xoff_;
+    if (mode_ == 7) {                       // expert e, projection p (0 gate, 1 up): rotate the inputs, permute
+        const int e = i / 2, p = i % 2;
+        const ExpertJobMulti& j = mjobs_[e];
+        Exl3Buf& b = exl3_buf_[(size_t) e];
+        thread_local uint16_t xf[MAXT * H];
+        thread_local uint16_t xh[MAXT * H];
+        for (int t = 0; t < j.nt; ++t) {
+            const float* x = (const float*) j.nact[t];
+            for (int c = 0; c < H; ++c) xf[t * H + c] = f2h(x[c]);
+        }
+        X.had_in(xf, (const uint16_t*) (j.blob + off[p == 0 ? EXL3_G_SUH : EXL3_U_SUH]), j.nt, H, xh);
+        X.prep_xq(xh, j.nt, H, b.xq[p]);
+    } else if (mode_ == 8) {                // expert e, gate/up block: 5 + 5 per expert
+        const int nb = FF / 128, e = i / (2 * nb), r = i % (2 * nb), p = r / nb, blk = r % nb;
+        const ExpertJobMulti& j = mjobs_[e];
+        Exl3Buf& b = exl3_buf_[(size_t) e];
+        X.gemv_blocks(b.xq[p], (const uint16_t*) (j.blob + off[p == 0 ? EXL3_G_TRELLIS : EXL3_U_TRELLIS]),
+                      (const uint16_t*) (j.blob + off[p == 0 ? EXL3_G_SVH : EXL3_U_SVH]), j.nt, H, FF, xbits_, kExl3Cb,
+                      blk, blk + 1, p == 0 ? b.g : b.u, nullptr);
+    } else if (mode_ == 9) {                // expert e: SwiGLU (fp16, like exl3_moe_coop's act_out), rotate, permute
+        const ExpertJobMulti& j = mjobs_[i];
+        Exl3Buf& b = exl3_buf_[(size_t) i];
+        for (int k = 0; k < j.nt * FF; ++k) {
+            const float g = b.g[k];
+            b.z[k] = f2h(g / (1.f + std::exp(-g)) * b.u[k]);
+        }
+        X.had_in(b.z, (const uint16_t*) (j.blob + off[EXL3_D_SUH]), j.nt, FF, b.zh);
+        X.prep_xq(b.zh, j.nt, FF, b.xq[0]);
+    } else {                                // mode 10: expert e, kExl3DownPer down blocks
+        const int per = H / 128 / kExl3DownPer, e = i / per, blk = (i % per) * kExl3DownPer;
+        const ExpertJobMulti& j = mjobs_[e];
+        Exl3Buf& b = exl3_buf_[(size_t) e];
+        X.gemv_blocks(b.xq[0], (const uint16_t*) (j.blob + off[EXL3_D_TRELLIS]),
+                      (const uint16_t*) (j.blob + off[EXL3_D_SVH]), j.nt, FF, H, xbits_, kExl3Cb, blk,
+                      blk + kExl3DownPer, b.d, nullptr);
+    }
+}
+
+bool ExpertPool::run_split_multi_exl3(const ExpertLayout& lay, int64_t layer, ExpertJobMulti* jobs, int n, const char*& err) {
+    if (n <= 0) return true;
+    const Exl3Lib& X = exl3_lib();
+    if (!X.ok) { err = X.err.c_str(); return false; }
+    if (exl3_buf_.size() < (size_t) kMaxSplitMulti) exl3_buf_.resize((size_t) kMaxSplitMulti);
+    const auto t0 = std::chrono::steady_clock::now();
+    if (g_call_spin_cfg_ns >= 0) g_call_spin_ns.store(g_call_spin_cfg_ns, std::memory_order_relaxed);
+    xlay_ = &lay;
+    xbits_ = lay.exl3_bits(layer);
+    for (int f = 0; f < EXL3_FIELDS; ++f) xoff_[f] = lay.exl3_off(layer, f);
+    for (int b0 = 0; b0 < n; b0 += kMaxSplitMulti) {
+        const int nb = (std::min)(kMaxSplitMulti, n - b0);
+        mjobs_ = jobs + b0;
+        const auto a = std::chrono::steady_clock::now();
+        run_phase(7, 2 * nb);
+        run_phase(8, nb * 2 * (FF / 128));
+        const auto b = std::chrono::steady_clock::now();
+        run_phase(9, nb);
+        const auto c = std::chrono::steady_clock::now();
+        run_phase(10, nb * (H / 128 / kExl3DownPer));
+        const auto dm0 = std::chrono::steady_clock::now();
+        for (int e = 0; e < nb; ++e)
+            for (int t = 0; t < mjobs_[e].nt; ++t)
+                std::memcpy(mjobs_[e].out[t], exl3_buf_[(size_t) e].d + (size_t) t * H, (size_t) H * sizeof(float));
+        const auto d = std::chrono::steady_clock::now();
+        if (g_st.on) g_st.memcpy_ms += std::chrono::duration<double, std::milli>(d - dm0).count();
+        ms_multi_gu += std::chrono::duration<double, std::milli>(b - a).count();
+        ms_multi_q += std::chrono::duration<double, std::milli>(c - b).count();
+        ms_multi_down += std::chrono::duration<double, std::milli>(d - c).count();
+    }
+    multi_bytes += (int64_t) n * (int64_t) lay.max_blob;
+    mode_ = 0;
+    if (g_call_spin_cfg_ns >= 0) g_call_spin_ns.store(0, std::memory_order_relaxed);
+    const double call_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    ms_drain_ += call_ms;
+    if (g_st.on) {
+        g_st.call_ms += call_ms; g_st.expert_n += n;
+        if (++g_st.calls % 1000 == 0) stats_print();
+    }
+    return true;
 }
 
 void ExpertPool::run(ExpertJob* jobs, int n) {

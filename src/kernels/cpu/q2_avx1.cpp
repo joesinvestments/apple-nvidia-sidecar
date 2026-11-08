@@ -23,7 +23,7 @@
 #include <cstdlib>
 #include <cstring>
 
-#if defined(__AVX2__) || defined(__FMA__) || defined(__F16C__)
+#if (defined(__AVX2__) || defined(__FMA__) || defined(__F16C__)) && !defined(STRATA_TGCU)
 #error "q2_avx1.cpp must be compiled without AVX2, FMA and F16C (see the per-source flags in CMakeLists.txt)"
 #endif
 

@@ -86,6 +86,13 @@ public:
     Verifier& operator=(const Verifier&) = delete;
     void set_remote_expert_opt(RemoteExpertOpt* opt) { remote_opt_ = opt; } // before init/capture
 
+    /// STRATA_XCH=1 (docs/strata-exchange-map.md 3.1-3.7, include/strata/xch/xch_host.hpp): run the windows on the
+    /// GPU <-> Metal exchange.  `region_host` is the Mac DMA region (xch_layout.h) and `region_dev` its device alias;
+    /// the graph publishes every layer's cold pairs into its slot and waits for Metal's landed word, and run() does no
+    /// per-layer host work.  After init, before the first run: the whole model in one stage, one group per window, the
+    /// EXL3 slim doorbell.  Drops the captured graphs so the next window captures with the exchange.
+    bool set_xch(void* region_host, void* region_dev, std::string& err);
+
     /// The watchdog's view of the window in flight (issue #31): the layer, the GPU's sequence, the flags.
     void diag(std::FILE* f) const;
     /// #649 (STRATA_VERIFY_TRACE=1, opt-in): the last windows' host-side handshake events and the GPU's breadcrumbs
@@ -563,6 +570,17 @@ private:
     bool ar_off_ = false;
     bool ar_on() const { return all_resident_ && !ar_off_; }
     void refresh_ar();
+    /// Per-layer zero-doorbell (EXL3 split, solo windows only): a layer whose every routable expert is in VRAM plans on
+    /// the device and never rings the host, while the layers that have experts out of VRAM still run the doorbell
+    /// handshake.  `ar_l_[l]` is the table (valid when `lyar_`), `db_idx_[l]` the number of doorbell layers before l:
+    /// the doorbell layers' rings are numbered contiguously from 1 and the CPU-rows flag runs one ahead of them (flag 1
+    /// is the window's PLE rows, raised at launch as in the all-resident graph).  A loan/shrink/swap hole in an
+    /// all-resident layer (ar_off_) sends the window through the all-doorbell graph exec_nr_ like any other stage.
+    bool lyar_ = false;
+    std::vector<uint8_t> ar_l_;
+    std::vector<int32_t> db_idx_;
+    std::vector<int32_t> db_layers_;    ///< the doorbell layers in order
+    bool mixed_on() const { return lyar_ && !ar_off_; }
     uint32_t* h_plan_err_ = nullptr; uint32_t* m_plan_err_ = nullptr;   // set by resident_plan on a -1 (all-resident graph)
     const int32_t* h_res_ = nullptr;      ///< the host residency table (VerifyHits::h_res)
     bool device_plan_ = false;            ///< E-6: resident-only layers planned on the device (STRATA_VERIFY_DEVICE_PLAN)
@@ -715,6 +733,23 @@ private:
     std::function<bool(cudaStream_t, std::string&)> pre_launch_;   // set_pre_launch
     int groups_[strata::kernels::kVerifyLongT + 1] = {};
     float* h_ymiss_ = nullptr;   float* m_ymiss_ = nullptr;     // T * k * n_embd
+    /// EXL3 slim doorbell (STRATA_EXL3_SLIM, default on for EXL3, solo windows): the host pulls only the miss rows of x,
+    /// reduces the CPU experts' outputs with the routing weights itself and pushes ONE n x n_embd row block plus the flag;
+    /// the GPU adds it to bo and zeroes it (no plan, flag A/B or per-entry rows over the link).
+    float* h_yred_ = nullptr;    float* m_yred_ = nullptr;      // T * n_embd
+    bool slim_ = false;
+    bool slim_on() const { return slim_ && remote_opt_ == nullptr && !device_plan_; }
+    // STRATA_XCH=1 (set_xch): the exchange region (xch_layout.h) and the window's epoch, read into VRAM once per window
+    void* xch_host_ = nullptr;        ///< the region's host address (the header words are written here)
+    uint8_t* xch_dev_ = nullptr;      ///< ... and its device alias (the slots are addressed from here)
+    float* xch_seen_ = nullptr;       ///< STRATA_XCH_SEEN=1: what the card added from each slot's y, 
+    uint32_t* d_xch_epoch_ = nullptr; ///< VRAM copy of the window's epoch (xch_epoch_load)
+    uint32_t xch_epoch_ = 0;          ///< the last window's epoch
+    bool xch_on_ = false;
+    /// the exchange runs an all-NVFP4 native pack (xch_blob_format == 1, strata/kernels/cpu/xch_format.hpp): the
+    /// card plans the layer's RESIDENT pairs on the device (resident_plan's allow_cold) and Metal computes the cold ones.
+    /// slim_ stays EXL3-only; the window's `slim` also opens for this.
+    bool xch_native_ = false;
 
     // device
     void* arena_ = nullptr;

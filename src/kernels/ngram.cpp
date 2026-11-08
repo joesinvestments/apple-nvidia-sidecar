@@ -622,6 +622,13 @@ bool PleTable::collect(float* out2560, std::string& err) {
     return true;
 }
 
+bool PleTable::warm_rows(const uint32_t* rows, size_t n_rows, std::string& err) {
+    if (impl_->mode != PleIo::Direct || !impl_->reader.is_open() || n_rows == 0) return true;
+    std::vector<uint8_t> raw(n_rows * (size_t) impl_->rb);
+    const auto ticket = impl_->reader.issue(rows, n_rows, raw.data());
+    return impl_->reader.collect(ticket, err);
+}
+
 bool PleTable::gather_batch(const uint32_t* rows, size_t n_tokens, float* out, std::string& err) {
     std::lock_guard<std::recursive_mutex> lk(impl_->mu);
     if (impl_->pending) { err = "PleTable::gather_batch while a token is in flight"; return false; }

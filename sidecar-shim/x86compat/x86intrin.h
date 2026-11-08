@@ -1,0 +1,8 @@
+#pragma once
+#if defined(_MSC_VER)
+#include <intrin.h>
+#elif defined(__x86_64__) || defined(_M_X64)
+#include_next <x86intrin.h>
+#else
+#include "immintrin.h"
+#endif
