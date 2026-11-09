@@ -1,0 +1,348 @@
+diff --git a/tinygrad/device.py b/tinygrad/device.py
+index 7042913..df3ef27 100644
+--- a/tinygrad/device.py
++++ b/tinygrad/device.py
+@@ -335,7 +335,11 @@ class Compiler:
+     return subprocess.Popen(argv.split() + [str(a) for a in args], stdout=subprocess.PIPE, stdin=subprocess.PIPE, bufsize=0)
+   def compile_server(self, src:str, proc:subprocess.Popen) -> bytes:
+     unwrap(proc.stdin).write(struct.pack("I", len(src.encode())) + src.encode())
+-    if (lib:=unwrap(proc.stdout).read(struct.unpack("I", unwrap(proc.stdout).read(4))[0])): return lib
++    def read_exact(n:int) -> bytes: # the pipe is unbuffered: a large cubin arrives in several short reads
++      buf = b''
++      while len(buf) < n and (chunk:=unwrap(proc.stdout).read(n - len(buf))): buf += chunk
++      return buf
++    if (lib:=read_exact(struct.unpack("I", read_exact(4))[0])): return lib
+     raise CompileError("Compilation Error")
+ 
+ 
+diff --git a/tinygrad/runtime/ops_nv.py b/tinygrad/runtime/ops_nv.py
+index 8c0b6d9..32b043f 100644
+--- a/tinygrad/runtime/ops_nv.py
++++ b/tinygrad/runtime/ops_nv.py
+@@ -235,7 +235,8 @@ class NVProgramData:
+   def __init__(self, dev:NVDevice, obj:TinyELF):
+     name, signature, mock = obj.name, obj.signature, isinstance(dev.iface, MOCKIface)
+     self.constbufs: dict[int, tuple[int, int]] = {0: (0, 0x160)} # dict[constbuf index, tuple[offset in the image, size]]
+-    self.relocs: list[tuple[int, int, DType, int]] = [] # (byte offset in the image, symbol offset, width, shift) of the program's address
++    # (byte offset in the image, symbol offset, width, shift, field mask, bits kept from the image) of the program's address
++    self.relocs: list[tuple[int, int, DType, int, int|None, int]] = []
+     self.prog_off, self.cbuf_0, sections, relocs = 0, [], list[Any](), list[Any]()
+     image:bytes = obj.lib
+ 
+@@ -262,10 +263,14 @@ class NVProgramData:
+             elif sh.name == ".nv.info" and param == 0x2f: regs = struct.unpack_from("II", data)[1] # EIATTR_REGCOUNT
+ 
+       # These reloc types are CUDA-specific: they all want the program's own address, which is only known once the linear links.
+-      for apply_image_offset, rel_sym_offset, typ, _ in relocs:
+-        if typ == 2: self.relocs.append((apply_image_offset, rel_sym_offset, dtypes.uint64, 0)) # R_CUDA_64
+-        elif typ == 0x38: self.relocs.append((apply_image_offset + 4, rel_sym_offset, dtypes.uint32, 0))
+-        elif typ == 0x39: self.relocs.append((apply_image_offset + 4, rel_sym_offset, dtypes.uint32, 32))
++      for apply_image_offset, rel_sym_offset, typ, addend in relocs:
++        rel_sym_offset += addend # RELA: CALL.ABS return addresses are the function plus the offset after the call
++        if typ == 2: self.relocs.append((apply_image_offset, rel_sym_offset, dtypes.uint64, 0, None, 0)) # R_CUDA_64
++        elif typ == 0x38: self.relocs.append((apply_image_offset + 4, rel_sym_offset, dtypes.uint32, 0, None, 0))
++        elif typ == 0x39: self.relocs.append((apply_image_offset + 4, rel_sym_offset, dtypes.uint32, 32, None, 0))
++        elif typ == 0x3a: # R_CUDA_ABS47_34 (CALL.ABS): address >> 2 in instruction bits [34, 81), so address bits [2, 49) at bit 32
++          for off, sh, mask in ((apply_image_offset + 4, 0, 0xfffffffc), (apply_image_offset + 8, 32, 0x1ffff)):
++            self.relocs.append((off, rel_sym_offset, dtypes.uint32, sh, mask, struct.unpack_from("<I", image, off)[0] & ~mask))
+         else: raise RuntimeError(f"unknown NV reloc {typ}")
+ 
+       # Minimum cbuf_0 size for driver params: Blackwell needs index 223 (224 entries), older GPUs need index 11 (12 entries)
+@@ -317,7 +322,8 @@ class NVProgramData:
+ def nv_build_program(dev:NVDevice, prg:UOp, devs:tuple[str, ...]) -> tuple[NVProgramData, UOp]:
+   data = NVProgramData(dev, prg.to_elf())
+   buf = make_program(prg, len(data.image), devs[0])
+-  rows = [(off, ((buf.getaddr(devs) + sym) >> sh).ccast(dt)) for off, sym, dt, sh in data.relocs]
++  rows = [(off, v if mask is None else (v & mask) | keep) for off, sym, dt, sh, mask, keep in data.relocs
++          for v in [((buf.getaddr(devs) + sym) >> sh).ccast(dt)]]
+   return data, patch(buf, rows, data.image)
+ 
+ class NVAllocator(Allocator['NVDevice']):
+diff --git a/b/tinygrad/runtime/support/apl_direct.py b/tinygrad/runtime/support/apl_direct.py
+new file mode 100644
+index 0000000..811306a
+--- /dev/null
++++ b/tinygrad/runtime/support/apl_direct.py
+@@ -0,0 +1,136 @@
++"""APLDirectPCIDevice: tinygrad talks to our dext in-process through libtgd.
++
++The GPU sits behind Thunderbolt/USB4 on a Mac Studio, so there is no /sys bus to scan: libtgd reaches the
++card through the dext directly. Set APL_DIRECT=1 to make System.list_devices return this device instead of
++the socket client (system.py reads the env var at call time, nothing is patched at import time).
++
++  APL_DIRECT=1 TGD_LIB=/path/libtgd.dylib <your script>
++"""
++from __future__ import annotations
++import ctypes, functools, os, struct
++from tinygrad.helpers import getenv, ceildiv, round_up
++from tinygrad.runtime.support.system import RemotePCIDevice
++from tinygrad.runtime.support.memory import MMIOInterface
++
++MAX_PAIRS = 64  # dext caps a DMA at 32 segments (TinyGPUDriver.cpp:145) plus the [0, 0] terminator
++
++@functools.cache
++def tgd() -> ctypes.CDLL:
++  lib = ctypes.CDLL(getenv("TGD_LIB", "libtgd.dylib"))
++  u32, u64, vp, i = ctypes.c_uint32, ctypes.c_uint64, ctypes.c_void_p, ctypes.c_int
++  for name, res, args in [("tgd_open", i, []), ("tgd_map_bar", vp, [i, i, ctypes.POINTER(u64)]),
++                          ("tgd_dma_alloc", vp, [u64, ctypes.POINTER(u64), u32, ctypes.POINTER(u64)]),
++                          ("tgd_dma_free", i, [u64, vp, u64]), ("tgd_mmio_copy", None, [vp, vp, u64]),
++                          ("tgd_cfg_read", i, [u32, u32, ctypes.POINTER(u32)]), ("tgd_cfg_write", i, [u32, u32, u32]),
++                          ("tgd_reset", i, []), ("tgd_spin_ge", u32, [vp, u32, u64]), ("tgd_land", None, [vp, u32])]:
++    fn = getattr(lib, name)
++    fn.restype, fn.argtypes = res, args
++  if hasattr(lib, "tgd_dma_register"):  # older libtgd builds do not have it
++    lib.tgd_dma_register.restype, lib.tgd_dma_register.argtypes = i, [vp, u64, ctypes.POINTER(u64), u32, ctypes.POINTER(u64)]
++    lib.tgd_dma_unregister.restype, lib.tgd_dma_unregister.argtypes = i, [u64]
++  return lib
++
++class DirectMMIOInterface(MMIOInterface):
++  """A BAR pointer in this process. Slices go through tgd_mmio_copy: aligned 32-bit or byte accesses only, so
++  Device memory never sees an unaligned or 16-byte access . Same return types as RemoteMMIOInterface:
++  bytes for fmt 'B' slices, lists otherwise. Scalars use the memoryview."""
++  def _span(self, k) -> tuple[int, int]:
++    if not isinstance(k, slice): return k, 1
++    start, stop, step = k.indices(len(self))
++    assert step == 1, "strided MMIO access is not supported"
++    return start, max(0, stop - start)
++
++  def __getitem__(self, k):
++    if not isinstance(k, slice): return self.mv[k]
++    start, cnt = self._span(k)
++    el = struct.calcsize(self.fmt)
++    buf = ctypes.create_string_buffer(cnt * el)
++    tgd().tgd_mmio_copy(buf, self.addr + start * el, cnt * el)
++    return buf.raw if self.fmt == 'B' else list(struct.unpack(f'<{cnt}{self.fmt}', buf.raw))
++
++  def __setitem__(self, k, v):
++    if not isinstance(k, slice):
++      self.mv[k] = v
++      return
++    start, cnt = self._span(k)
++    el = struct.calcsize(self.fmt)
++    if self.fmt == 'B' or not isinstance(v, (list, tuple)): data = bytes(v)
++    else: data = struct.pack(f'<{len(v)}{self.fmt}', *v)
++    assert len(data) == cnt * el, f"MMIO write of {len(data)} bytes into a {cnt * el} byte slice"
++    tgd().tgd_mmio_copy(self.addr + start * el, data, len(data))
++
++  def view(self, offset:int=0, size:int|None=None, fmt=None) -> DirectMMIOInterface:
++    return DirectMMIOInterface(self.addr+offset, (self.nbytes - offset) if size is None else size, fmt=fmt or self.fmt)
++
++class APLDirectPCIDevice(RemotePCIDevice):
++  """Subclasses RemotePCIDevice on purpose: PCIIfaceBase then treats it as remote, so the Linux-only VA
++  reservation and the sysmem munmap stay off, exactly as for the socket client. Overrides every method that
++  would touch the socket."""
++  @staticmethod
++  def scan(vendor:int, devices:tuple[tuple[int, tuple[int, ...]], ...], base_class:int|None) -> list[tuple]:
++    if (rc:=tgd().tgd_open()) != 0: return []
++    cfg = ctypes.c_uint32()
++    if tgd().tgd_cfg_read(0, 4, ctypes.byref(cfg)) != 0: return []
++    dword = cfg.value
++    if dword & 0xffff != vendor: return []
++    dev = (dword >> 16) & 0xffff
++    if not any((dev & mask) in devlist for mask, devlist in devices): return []
++    return [(APLDirectPCIDevice, 'usb4:apl0')]  # 'usb4' as tinygrad's own 09-05 Mac client; nv/ip.py bdf_as_int maps 'usb*' to 0
++
++  def __init__(self, devpref:str, pcibus:str):
++    if (rc:=tgd().tgd_open()) != 0:
++      raise RuntimeError("APL_DIRECT: no 'tinygpu' service (dext not loaded or no GPU)" if rc == -1 else
++                         f"APL_DIRECT: IOServiceOpen failed {rc:#x} (dext refuses this client)")
++    self.pcibus, self.dev_id, self.peer_group, self.irq_poller = pcibus, 0, "APLDirect", None
++    self.dma_allocs:dict[int, tuple[int, int]] = {}  # ptr -> (handle, mapped size); tinygrad rarely frees sysmem
++    self.host_regs:dict[int, int] = {}  # key -> handle from tgd_dma_register for existing host memory
++
++  @functools.cache
++  def bar_info(self, bar_idx:int) -> tuple[int, int]:
++    size = ctypes.c_uint64()
++    if not (addr:=tgd().tgd_map_bar(bar_idx, 0, ctypes.byref(size))): raise RuntimeError(f"APL_DIRECT: map BAR{bar_idx} failed")
++    return addr, size.value  # like the socket path, [0] is a CPU address, not a bus address
++
++  def map_bar(self, bar:int, off:int=0, addr:int=0, size:int|None=None, fmt='B') -> MMIOInterface:
++    base, bsize = self.bar_info(bar)
++    return DirectMMIOInterface(base + off, size or (bsize - off), fmt=fmt)
++
++  def alloc_sysmem(self, size:int, vaddr:int=0, contiguous:bool=False) -> tuple[MMIOInterface, list[int]]:
++    pairs, handle = (ctypes.c_uint64 * (2 * MAX_PAIRS))(), ctypes.c_uint64()
++    if not (ptr:=tgd().tgd_dma_alloc(size, pairs, MAX_PAIRS, ctypes.byref(handle))): raise RuntimeError(f"APL_DIRECT: DMA alloc of {size:#x} failed")
++    mapped = round_up(max(size, 1), 0x4000)  # libtgd rounds the same way (16 KiB pages)
++    self.dma_allocs[ptr] = (handle.value, mapped)
++    segs = [(pairs[2*i], pairs[2*i+1]) for i in range(MAX_PAIRS) if pairs[2*i+1]]
++    # same return shape as the socket path: 4 KiB page addresses, one per page of every segment
++    return MMIOInterface(ptr, mapped, fmt='B'), [p + i for p, sz in segs for i in range(0, sz, 0x1000)][:ceildiv(size, 0x1000)]
++
++  def free_sysmem(self, view:MMIOInterface):
++    handle, mapped = self.dma_allocs.pop(view.addr)
++    if (rc:=tgd().tgd_dma_free(handle, view.addr, mapped)) != 0: raise RuntimeError(f"APL_DIRECT: DMA free of {view.addr:#x} failed {rc:#x}")
++
++  def cpu_view(self, addr:int, size:int) -> MMIOInterface: return MMIOInterface(addr, size, fmt='B')
++
++  def register_host(self, addr:int, size:int, key:int) -> list[int]:
++    # Register existing host memory: the dext maps the enclosing 16 KiB pages, tinygrad gets the 4 KiB pages of [addr, addr+size).
++    lo, hi = addr & ~0x3fff, round_up(addr + size, 0x4000)
++    pairs, handle = (ctypes.c_uint64 * (2 * MAX_PAIRS))(), ctypes.c_uint64()
++    if (rc:=tgd().tgd_dma_register(lo, hi - lo, pairs, MAX_PAIRS, ctypes.byref(handle))) != 0:
++      raise RuntimeError(f"APL_DIRECT: DMA register of {addr:#x}+{size:#x} failed {rc}")
++    self.host_regs[key] = handle.value
++    segs = [(pairs[2*i], pairs[2*i+1]) for i in range(MAX_PAIRS) if pairs[2*i+1]]
++    pages = [p + i for p, sz in segs for i in range(0, sz, 0x1000)]  # same shape as alloc_sysmem: 4 KiB page addresses
++    return pages[(addr - lo) // 0x1000:(addr - lo) // 0x1000 + ceildiv(size, 0x1000)]
++
++  def unregister_host(self, key:int):
++    if (handle:=self.host_regs.pop(key, None)) is not None:
++      if (rc:=tgd().tgd_dma_unregister(handle)) != 0: raise RuntimeError(f"APL_DIRECT: DMA unregister of {handle} failed {rc}")
++
++  def reset(self):
++    if (rc:=tgd().tgd_reset()) != 0: raise RuntimeError(f"APL_DIRECT: reset failed {rc:#x}")
++  def read_config(self, offset:int, size:int) -> int:
++    val = ctypes.c_uint32()
++    if (rc:=tgd().tgd_cfg_read(offset, size, ctypes.byref(val))) != 0: raise RuntimeError(f"APL_DIRECT: cfg read {offset:#x} failed {rc:#x}")
++    return val.value
++  def write_config(self, offset:int, value:int, size:int):
++    if (rc:=tgd().tgd_cfg_write(offset, size, value)) != 0: raise RuntimeError(f"APL_DIRECT: cfg write {offset:#x} failed {rc:#x}")
++  def resize_bar(self, bar_idx:int): pass  # the dext maps the bars it has, there is nothing to resize
+diff --git a/tinygrad/runtime/support/nv/ip.py b/tinygrad/runtime/support/nv/ip.py
+index d178151..8e0546a 100644
+--- a/tinygrad/runtime/support/nv/ip.py
++++ b/tinygrad/runtime/support/nv/ip.py
+@@ -2,11 +2,27 @@ from __future__ import annotations
+ import ctypes, time, array, struct, itertools, dataclasses
+ from typing import cast, Any
+ from tinygrad.runtime.autogen import nv, nv_570 as nv_gpu, pci
+-from tinygrad.helpers import lo32, hi32, DEBUG, round_up, round_down, fetch_fw, wait_cond, ceildiv
++from tinygrad.helpers import lo32, hi32, DEBUG, round_up, round_down, fetch_fw, wait_cond, ceildiv, getenv
+ from tinygrad.runtime.support.system import System
+ from tinygrad.runtime.support.memory import MMIOInterface
+ from tinygrad.runtime.support.elf import elf_loader
+ 
++def keep_out_top(pa, lo:int) -> int:
++  # the GSP region starts at lo (relative to pa.base): the pool ends there. Returns the MiB kept out.
++  if lo >= pa.size: return 0
++  start = max(s for s in pa.blocks if s <= lo)
++  size, _, _, free = pa.blocks[start]
++  assert free and start + size == pa.size, f"VRAM {pa.base + start:#x}+{size:#x} under the GSP region at {pa.base + lo:#x} is already in use"
++  if start < lo: pa._split_block(start, size, lo - start)
++  pa._remove_block(lo, pa.size - lo)
++  return (pa.size - lo) >> 20
++
++def fmc_reserved_start(vram_size:int, boot_sz:int, radix3_sz:int) -> int:
++  # fmc_boot sizes (GspFwWprMeta, vga + frts + boot + radix3 + gsp heap + non-WPR heap + pmu reserved) plus a 32 MiB margin,
++  # rounded down to a 2 MiB boundary: a conservative lower bound of where the firmware places its region.
++  rsvd = 0x20000 + 0x100000 + boot_sz + radix3_sz + 0x8700000 + 0x220000 + 0x1820000 + (32 << 20)
++  return round_down(vram_size - rsvd, 2 << 20)
++
+ @dataclasses.dataclass(frozen=True)
+ class GRBufDesc: size:int; virt:bool; phys:bool; local:bool=False # noqa: E702
+ 
+@@ -108,7 +124,20 @@ class NV_FLCN(NV_IP):
+     self.prep_booter()
+ 
+   def prep_ucode(self):
+-    vbios_bytes, vbios_off = memoryview(bytes(array.array('I', self.nvdev.mmio[0x00300000//4:(0x00300000+0x100000)//4]))), 0
++    # the PROM window can return garbage while a previous session's GSP is still winding down (a process killed with work
++    # stuck on the GPU): read it in 64 KB pieces and keep a piece only once two consecutive reads agree
++    def prom(off:int, n:int) -> bytes: return bytes(array.array('I', self.nvdev.mmio[(0x00300000+off)//4:(0x00300000+off+n)//4]))
++    pieces = []
++    for off in range(0, 0x100000, 0x10000):
++      prev = prom(off, 0x10000)
++      for _ in range(50):
++        cur = prom(off, 0x10000)
++        if cur == prev: break
++        prev = cur
++        time.sleep(0.05)
++      else: raise RuntimeError(f"VBIOS read at {off:#x} never stabilized")
++      pieces.append(cur)
++    vbios_bytes, vbios_off = memoryview(b"".join(pieces)), 0
+     while True:
+       pci_blck = vbios_bytes[vbios_off + nv.OFFSETOF_PCI_EXP_ROM_PCI_DATA_STRUCT_PTR:].cast('H')[0]
+       imglen = vbios_bytes[vbios_off + pci_blck + nv.OFFSETOF_PCI_DATA_STRUCT_IMAGE_LEN:].cast('H')[0] * nv.PCI_ROM_IMAGE_BLOCK_SIZE
+@@ -500,6 +529,11 @@ class NV_GSP(NV_IP):
+     if self.nvdev.fmc_boot:
+       m = nv.GspFwWprMeta(**common, vgaWorkspaceSize=0x20000, pmuReservedSize=0x1820000, nonWprHeapSize=0x220000, gspFwHeapSize=0x8700000,
+         frtsSize=0x100000)
++      # the firmware places its region from the top of the VRAM down (VGA workspace, FRTS, boot, radix3, GSP heap, non-WPR heap, PMU reserved):
++      # a write into the overlap hangs the GPU, so the pool ends at a conservative lower bound of that start
++      pa, rsvd_start = self.nvdev.mm.pa_allocator, fmc_reserved_start(self.nvdev.vram_size, boot_sz, radix3_sz)
++      kept = keep_out_top(pa, rsvd_start - pa.base)
++      if DEBUG >= 1: print(f"nv: {kept} MiB at the top of the VRAM pool kept out (GSP region from {rsvd_start >> 20} MiB)")
+     else:
+       m = nv.GspFwWprMeta(**common, vgaWorkspaceSize=(vga_sz:=0x100000), vgaWorkspaceOffset=(vga_off:=self.nvdev.vram_size-vga_sz),
+         gspFwWprEnd=vga_off, frtsSize=(frts_sz:=0x100000), frtsOffset=(frts_off:=vga_off-frts_sz), bootBinOffset=(boot_off:=frts_off-boot_sz),
+@@ -507,6 +541,11 @@ class NV_GSP(NV_IP):
+         gspFwHeapOffset=(gsp_heap_off:=round_down(gsp_off-gsp_heap_sz, 0x100000)), gspFwWprStart=(wpr_st:=round_down(gsp_heap_off-0x1000, 0x100000)),
+         nonWprHeapSize=(non_wpr_sz:=0x100000), nonWprHeapOffset=(non_wpr_off:=round_down(wpr_st-non_wpr_sz, 0x100000)), gspFwRsvdStart=non_wpr_off)
+       assert self.nvdev.flcn.frts_offset == m.frtsOffset, f"FRTS mismatch: {self.nvdev.flcn.frts_offset} != {m.frtsOffset}"
++      # the GSP region (non-WPR heap up to the VGA workspace, ~200 MiB) is larger than the 64 MiB the memory manager leaves at the top: a write
++      # into the overlap hangs the GPU (seen as a memset that never finishes once VRAM fills up), so the pool ends where the region starts
++      pa = self.nvdev.mm.pa_allocator
++      kept = keep_out_top(pa, m.gspFwRsvdStart - pa.base)
++      if DEBUG >= 1: print(f"nv: {kept} MiB at the top of the VRAM pool kept out (GSP region from {m.gspFwRsvdStart >> 20} MiB)")
+     if sram_boot:
+       self._boot_sram, self.wpr_meta_sysmem = self._build_sram_wpr(m), 0x200000
+     else:
+@@ -580,7 +619,12 @@ class NV_GSP(NV_IP):
+     self.priv_root = 0xc1e00004
+     self.init_golden_image()
+ 
+-  def fini_hw(self): self.rpc_unloading_guest_driver()
++  def fini_hw(self):
++    # a clean GSP unload at exit poisons the next boot on Blackwell, so keep the GSP resident there (a resident GSP kept
++    # DMA-ing into unmapped host memory panics macOS on Ada, so that family still unloads). NV_GSP_RESIDENT overrides.
++    if (resident:=getenv('NV_GSP_RESIDENT', -1)) == 1: return
++    if resident == -1 and self.nvdev.chip_name.startswith('GB2'): return
++    self.rpc_unloading_guest_driver()
+ 
+   ### RPCs
+ 
+@@ -676,6 +720,10 @@ class NV_GSP(NV_IP):
+ 
+   def rpc_set_registry_table(self):
+     table = {'RMForcePcieConfigSave': 0x1, 'RMSecBusResetEnable': 0x1}
++    # an Ada part behind an Intel TB bridge drops the port on the first link retrain without these, and the pin is sticky
++    # (it survives a hot reset and a fresh GSP boot), so it is opt-in and never reaches a Blackwell part.
++    if getenv('NV_PCIE_GEN1', 0) == 1 and not self.nvdev.chip_name.startswith('GB2'):
++      table |= {'RMPcieLinkSpeed': 0x800002AA, 'PCIEPowerControl': 0x3}
+     entries_bytes, data_bytes = bytes(), bytes()
+     hdr_size, entries_size = ctypes.sizeof(nv.PACKED_REGISTRY_TABLE), ctypes.sizeof(nv.PACKED_REGISTRY_ENTRY) * len(table)
+ 
+diff --git a/tinygrad/runtime/support/system.py b/tinygrad/runtime/support/system.py
+index 1023c92..39efe6e 100644
+--- a/tinygrad/runtime/support/system.py
++++ b/tinygrad/runtime/support/system.py
+@@ -127,6 +127,9 @@ class _System:
+ 
+   @functools.cache
+   def list_devices(self, vendor:int, devices:tuple[tuple[int, tuple[int, ...]], ...], base_class:int|None=None):
++    if getenv("APL_DIRECT", 0):
++      from tinygrad.runtime.support.apl_direct import APLDirectPCIDevice
++      return APLDirectPCIDevice.scan(vendor, devices, base_class)
+     if getenv("REMOTE", ""): return RemotePCIDevice.scan(vendor, devices, base_class)
+     return [(PCIDevice, x) for x in System.pci_scan_bus(vendor, devices, base_class)]
+ 
+@@ -329,7 +332,9 @@ class PCIIfaceBase:
+     if storage.meta.mapping.aspace is AddrSpace.PHYS: self.dev_impl.mm.vfree(storage.meta.mapping)
+     if storage.meta.has_cpu_mapping and self.remote is None: FileIOInterface.munmap(storage.buf, storage.meta.mapping.size)
+ 
+-  def unmap(self, mapping:BufferStorage): self.dev_impl.mm.unmap_range(*mapping.meta)
++  def unmap(self, mapping:BufferStorage):
++    self.dev_impl.mm.unmap_range(*mapping.meta)
++    if hasattr(self.pci_dev, 'unregister_host'): self.pci_dev.unregister_host(mapping.meta[0])
+ 
+   def p2p_paddrs(self, paddrs:list[tuple[int,int]]) -> tuple[list[tuple[int,int]], AddrSpace]:
+     return [(p + self.pci_dev.bar_info(self.vram_bar)[0], sz) for p, sz in paddrs], AddrSpace.SYS
+@@ -341,10 +346,13 @@ class PCIIfaceBase:
+       lo, size = b._buf, round_up(b.nbytes, 0x1000)
+       if not self.dev_impl.mm.va_base <= lo < lo + size <= self.dev_impl.mm.va_base + (1 << self.dev_impl.mm.va_bits):
+         raise RuntimeError(f"Host address {lo:#x} is outside the GPU virtual address range")
+-      if self.remote is None: System.lock_memory(lo, size)
+-      paddrs = [(x, 0x1000) for x in (b.meta if self.remote is not None else System.system_paddrs(lo, size))]
+-      aspace, snooped, uncached = AddrSpace.SYS, True, True
++      host_lo = lo
+       if b.options.cpu_access: lo = self.dev_impl.mm.alloc_vaddr(size) # nv semaphores only reach 40 bits
++      if hasattr(self.pci_dev, 'register_host'): paddrs = [(x, 0x1000) for x in self.pci_dev.register_host(host_lo, size, key=lo)]
++      else:
++        if self.remote is None: System.lock_memory(host_lo, size)
++        paddrs = [(x, 0x1000) for x in (b.meta if self.remote is not None else System.system_paddrs(host_lo, size))]
++      aspace, snooped, uncached = AddrSpace.SYS, True, True
+     elif isinstance(ifa:=getattr(Device[b.device], "iface", None), PCIIfaceBase) and ifa.peer_group == self.peer_group:
+       if ifa.is_bar_small(): raise RuntimeError(f"P2P mapping not supported for small bar devices: {b.device} -> {self.dev.device}")
+       lo, size, snooped, uncached = b._buf, b.meta.mapping.size, True, b.meta.mapping.uncached

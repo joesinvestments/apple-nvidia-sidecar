@@ -12,7 +12,7 @@ The command fails on a missing prerequisite, compiler error or link error. It le
 
 `config/sidecar.json` holds the selected model, cache and exchange policy; its `reasons` section explains the settings. The only policy adjustment from the selected engine is 19340 Metal slots: the newer engine had fewer card cache slots and 19300 left 35 RAM-tier entries without Metal copies. Default-off experimental environment switches and a Metal parameter the lane refused are omitted; the three zero-valued command options remain explicit because upstream otherwise enables those paths. The model weights are not bundled; link a prepared compatible model at `weights` (with `weights/pack/tokenizer` and the referenced dense, PLE and MTP files). The ranked expert profile is tracked in `data/`.
 
-The dock driver and its tinygrad-backed runtime are installed prerequisites; see the README. Set `SIDECAR_TGD_LIB` to that driver's dylib, `SIDECAR_TINYGRAD` to the installed tinygrad source root, and `SIDECAR_PY_SITE` to the runtime Python environment's site-packages. Start from the checkout root with that Python environment:
+The dock driver and its tinygrad-backed runtime are installed prerequisites; build them with [`driver/README.md`](driver/README.md) first. Set `SIDECAR_TGD_LIB` to that driver's dylib, `SIDECAR_TINYGRAD` to the installed tinygrad source root, and `SIDECAR_PY_SITE` to the runtime Python environment's site-packages. Start from the checkout root with that Python environment:
 
     python3.12 serve/server.py --engine strata --config config/sidecar.json --port 8090
 

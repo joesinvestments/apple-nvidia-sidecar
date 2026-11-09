@@ -4,7 +4,7 @@ A Mac and NVIDIA RTX 5090 split inference engine built from [Strata v0.2.11](htt
 
 ## Hardware and prerequisites
 
-Tested on two Mac Studio machines (M5 Max, 40 GPU cores, 64 GB, macOS 27), each with an NVIDIA GeForce RTX 5090 in a USB4 v2 dock on an 80 Gb/s Thunderbolt link. An arm64 macOS host, the locally installed dock driver and tinygrad source, Python 3.12, Xcode/Metal tools, clang, ninja, Colima/Docker with a CUDA build image, CUDA 12.8 host headers and SIMDe headers are required. The official signed graphics-driver installation path has not been tested. Other machines and configurations have not been proved.
+Tested on two identical setups: a Mac Studio (M5 Max, 64 GB), an NVIDIA GeForce RTX 5090 and a MINISFORUM DEG2 Thunderbolt 5 dock. An arm64 macOS host, the dock driver and patched tinygrad built by [`driver/README.md`](driver/README.md), Python 3.12, Xcode/Metal tools, clang, ninja, Colima/Docker with a CUDA build image, CUDA 12.8 host headers and SIMDe headers are required. The official signed graphics-driver installation path has not been tested. Other machines and configurations have not been proved.
 
 ## Model weights
 
@@ -12,7 +12,7 @@ No weights are in this repository. The tested weights come from the public, unga
 
 ## The driver is the hard part
 
-The tested card path uses a locally modified TinyGPU DriverKit driver, ad-hoc signed without a developer team. It is not included, and you cannot reproduce it by installing a public signed package. The official signed driver path has not been tested with this engine. Expect to build and approve your own driver from [tinygrad](https://github.com/tinygrad/tinygrad) under `extra/usbgpu/tbgpu/installer/`, or to make the signed path work and tell us. This is the first thing we would like help with.
+The tested card path uses a locally modified TinyGPU DriverKit driver, ad-hoc signed without a developer team, on a Mac with System Integrity Protection turned off. No compiled driver is included, for the reasons in [`driver/README.md`](driver/README.md). That guide has the exact steps we used, with our driver changes, the `libtgd` card library and our tinygrad changes as source. The public signed TinyGPU has not been made to work with this engine, and reading the code says it will need changes. Making it work is the first thing we would like help with.
 
 ## Memory settings
 
@@ -26,7 +26,7 @@ Run `tools/build-sidecar.sh` with `SIDECAR_DOCKER`, `SIDECAR_COLIMA`, `SIDECAR_P
 
 ## Limits and evidence
 
-The selected deployment serves one conversation at a time. Installation was proved only on our two machines; this preview makes no claim about speed on other hardware. The signed graphics-driver path remains untested, and our own driver is not included (see above). This repository contains source, not model weights. No performance numbers are claimed here; test and build receipts stay with the machines on which they were measured.
+The selected deployment serves one conversation at a time. Installation was proved only on our two machines; this preview makes no claim about speed on other hardware. The signed graphics-driver path remains untested, and no compiled driver is included (see above). This repository contains source, not model weights. No performance numbers are claimed here; test and build receipts stay with the machines on which they were measured.
 
 ## License and credits
 

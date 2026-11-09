@@ -1,0 +1,206 @@
+diff --git a/TinyGPUDriverExtension/TinyGPUDriver.cpp b/TinyGPUDriverExtension/TinyGPUDriver.cpp
+--- a/TinyGPUDriverExtension/TinyGPUDriver.cpp
++++ b/TinyGPUDriverExtension/TinyGPUDriver.cpp
+@@ -59,6 +59,14 @@ kern_return_t TinyGPUDriver::Start_Impl(IOService* in_provider)
+ 	commandRegister |= (kIOPCICommandIOSpace | kIOPCICommandBusMaster | kIOPCICommandMemorySpace);
+ 	ivars->pci->ConfigurationWrite16(kIOPCIConfigurationOffsetCommand, commandRegister);
+ 
++	// log every BAR once at start
++	for (uint32_t b = 0; b < 6; b++) {
++		uint8_t bidx = 0, btype = 0;
++		uint64_t bsize = 0;
++		if (ivars->pci->GetBARInfo(b, &bidx, &bsize, &btype) == kIOReturnSuccess)
++			os_log(OS_LOG_DEFAULT, "tinygpu: bar %u idx=%u size=0x%llx type=0x%x", b, bidx, bsize, btype);
++	}
++
+ 	memcpy((void*)service_name, (void*)"tinygpu\0", 8);
+ 	SetName(service_name);
+ 
+@@ -92,13 +100,15 @@ error:
+ 	return err;
+ }
+ 
+-kern_return_t TinyGPUDriver::MapBar(uint32_t bar, IOMemoryDescriptor** memory)
++kern_return_t TinyGPUDriver::MapBar(uint32_t bar, bool wc, IOMemoryDescriptor** memory)
+ {
+ 	uint8_t barMemoryIndex, barMemoryType;
+ 	uint64_t barMemorySize;
+ 	kern_return_t err = ivars->pci->GetBARInfo(bar, &barMemoryIndex, &barMemorySize, &barMemoryType);
+ 	if (err) return err;
+-	os_log(OS_LOG_DEFAULT, "tinygpu: bar mapping %d idx=%d", bar, barMemoryIndex);
++	os_log(OS_LOG_DEFAULT, "tinygpu: bar mapping %d idx=%d wc=%d", bar, barMemoryIndex, wc);
++	// WC mapping for BAR1/VRAM; private SDK call (IOPCIDevice.iig IOPCIDevicePrivate)
++	if (wc) return ivars->pci->_CopyWCDeviceMemoryWithIndex(barMemoryIndex, memory, this);
+ 	return ivars->pci->_CopyDeviceMemoryWithIndex(barMemoryIndex, memory, this);
+ }
+ 
+@@ -150,7 +160,7 @@ kern_return_t TinyGPUDriver::CreateDMA(size_t size, TinyGPUCreateDMAResp* dmaDes
+ 	err = WriteDMASegments(sharedBuf, segments, segCount, IOVMPageSize, IOVMPageSize);
+ 	if (err) { dmaCmd->CompleteDMA(kIODMACommandCompleteDMANoOptions); dmaCmd->release(); sharedBuf->release(); return err; }
+ 
+-	dmaDesc->sharedBuf = sharedBuf;
++	dmaDesc->mem = sharedBuf; // field renamed
+ 	dmaDesc->dmaCmd = dmaCmd;
+ 	os_log(OS_LOG_DEFAULT, "tinygpu: CreateDMA size=0x%zx segs=%u", size, segCount);
+ 	return 0;
+diff --git a/TinyGPUDriverExtension/TinyGPUDriver.iig b/TinyGPUDriverExtension/TinyGPUDriver.iig
+--- a/TinyGPUDriverExtension/TinyGPUDriver.iig
++++ b/TinyGPUDriverExtension/TinyGPUDriver.iig
+@@ -9,7 +9,8 @@
+ 
+ struct TinyGPUCreateDMAResp
+ {
+-	IOBufferMemoryDescriptor* sharedBuf;
++	// any descriptor, so PrepareDMA can retain the client's struct-input descriptor too
++	IOMemoryDescriptor* mem;
+ 	IODMACommand* dmaCmd;
+ };
+ 
+@@ -26,7 +27,8 @@ public:
+ 
+ 	virtual kern_return_t NewUserClient(uint32_t in_type, IOUserClient** out_user_client) override;
+ 
+-	kern_return_t MapBar(uint32_t bar, IOMemoryDescriptor** memory) LOCALONLY;
++	// wc = write-combined mapping (map types 8..13)
++	kern_return_t MapBar(uint32_t bar, bool wc, IOMemoryDescriptor** memory) LOCALONLY;
+ 	kern_return_t CreateDMA(size_t size, TinyGPUCreateDMAResp* dmaDesc) LOCALONLY;
+ 	kern_return_t SetupDMA(IOMemoryDescriptor* memory, uint64_t size, IODMACommand** outCmd,
+ 	                       IOAddressSegment* segments, uint32_t* segCount) LOCALONLY;
+diff --git a/TinyGPUDriverExtension/TinyGPUDriverUserClient.cpp b/TinyGPUDriverExtension/TinyGPUDriverUserClient.cpp
+--- a/TinyGPUDriverExtension/TinyGPUDriverUserClient.cpp
++++ b/TinyGPUDriverExtension/TinyGPUDriverUserClient.cpp
+@@ -34,6 +34,20 @@ struct TinyGPUDriverUserClient_IVars
+ 	}
+ };
+ 
++// free one DMA slot: CompleteDMA, then release the command and the retained descriptor
++static void ReleaseDMA(TinyGPUCreateDMAResp &d)
++{
++	if (d.dmaCmd) {
++		d.dmaCmd->CompleteDMA(kIODMACommandCompleteDMANoOptions);
++		d.dmaCmd->release();
++		d.dmaCmd = nullptr;
++	}
++	if (d.mem) {
++		d.mem->release();
++		d.mem = nullptr;
++	}
++}
++
+ bool TinyGPUDriverUserClient::init()
+ {
+ 	auto ok = super::init();
+@@ -79,14 +93,7 @@ kern_return_t TinyGPUDriverUserClient::Stop_Impl(IOService* in_provider)
+ {
+ 	// release all DMA allocations for this client
+ 	if (ivars) {
+-		for (size_t i = 0; i < ivars->dmaCount; i++) {
+-			auto &d = ivars->dmas[i];
+-			if (d.dmaCmd) {
+-				d.dmaCmd->CompleteDMA(kIODMACommandCompleteDMANoOptions);
+-				d.dmaCmd->release();
+-				d.dmaCmd = nullptr;
+-			}
+-		}
++		for (size_t i = 0; i < ivars->dmaCount; i++) ReleaseDMA(ivars->dmas[i]); // also releases descriptors
+ 		ivars->dmaCount = 0;
+ 		IOSafeDeleteNULL(ivars->dmas, TinyGPUCreateDMAResp, ivars->dmaCap);
+ 		ivars->dmas = nullptr;
+@@ -100,7 +107,7 @@ kern_return_t TinyGPUDriverUserClient::ExternalMethod(uint64_t selector, IOUserC
+ {
+ 	kern_return_t err = 0;
+ 
+-	os_log(OS_LOG_DEFAULT, "tinygpu: rpc (%llu) in:%d, out:%d", selector, args->scalarInputCount, args->scalarOutputCount);
++	// per-call rpc/cfg logs removed (hot path); error logs kept
+ 
+ 	if (selector == TinyGPURPC::ReadCfg) {
+ 		if (args->scalarInputCount != 2 or args->scalarOutputCount < 1) return kIOReturnBadArgument;
+@@ -110,7 +117,6 @@ kern_return_t TinyGPUDriverUserClient::ExternalMethod(uint64_t selector, IOUserC
+ 
+ 		uint32_t val = 0;
+ 		err = ivars->provider->CfgRead(off, size, &val);
+-		os_log(OS_LOG_DEFAULT, "tinygpu: read cfg off:%x sz:%d, val:%x", off, size, val);
+ 
+ 		if (!err) {
+ 			args->scalarOutput[0] = val;
+@@ -124,7 +130,6 @@ kern_return_t TinyGPUDriverUserClient::ExternalMethod(uint64_t selector, IOUserC
+ 		uint32_t size = uint32_t(args->scalarInput[1]);
+ 		uint32_t val = uint32_t(args->scalarInput[2]);
+ 
+-		os_log(OS_LOG_DEFAULT, "tinygpu: wr cfg off:%x sz:%d, val:%x", off, size, val);
+ 		return ivars->provider->CfgWrite(off, size, val);
+ 	} else if (selector == TinyGPURPC::Reset) {
+ 		os_log(OS_LOG_DEFAULT, "tinygpu: reset");
+@@ -149,7 +154,7 @@ kern_return_t TinyGPUDriverUserClient::ExternalMethod(uint64_t selector, IOUserC
+ 		// write physical addresses to output: [addr0, len0, addr1, len1, ..., 0, 0]
+ 		IOMemoryMap* outMap = nullptr;
+ 		err = args->structureOutputDescriptor->CreateMapping(0, 0, 0, 0, 0, &outMap);
+-		if (err || !outMap) { os_log(OS_LOG_DEFAULT, "tinygpu: output map failed err=%d", err); dmaCmd->release(); return err; }
++		if (err || !outMap) { os_log(OS_LOG_DEFAULT, "tinygpu: output map failed err=%d", err); dmaCmd->CompleteDMA(kIODMACommandCompleteDMANoOptions); dmaCmd->release(); return err ?: kIOReturnError; } // undo the prepare too
+ 
+ 		uint64_t* out = (uint64_t*)outMap->GetAddress();
+ 		for (uint32_t i = 0; i < segCount; i++) { out[i * 2] = segments[i].address; out[i * 2 + 1] = segments[i].length; }
+@@ -157,7 +162,22 @@ kern_return_t TinyGPUDriverUserClient::ExternalMethod(uint64_t selector, IOUserC
+ 		outMap->release();
+ 
+ 		os_log(OS_LOG_DEFAULT, "tinygpu: PrepareDMA size=%llu segs=%u", size, segCount);
+-		ivars->dmas[ivars->dmaCount++] = {nullptr, dmaCmd};
++		// retain the client's descriptor with its command; the slot index is the handle,
++		// returned only when the caller asked for a scalar output (server.c's struct-only call keeps working)
++		args->structureInputDescriptor->retain();
++		uint64_t handle = ivars->dmaCount;
++		ivars->dmas[ivars->dmaCount++] = {args->structureInputDescriptor, dmaCmd};
++		if (args->scalarOutputCount >= 1) {
++			args->scalarOutput[0] = handle;
++			args->scalarOutputCount = 1;
++		}
++		return kIOReturnSuccess;
++	} else if (selector == TinyGPURPC::CompleteDMA) {
++		// free one PrepareDMA handle
++		if (args->scalarInputCount != 1) return kIOReturnBadArgument;
++		uint64_t h = args->scalarInput[0];
++		if (h >= ivars->dmaCount || !ivars->dmas[h].dmaCmd) return kIOReturnBadArgument;
++		ReleaseDMA(ivars->dmas[h]);
+ 		return kIOReturnSuccess;
+ 	}
+ 
+@@ -169,11 +189,12 @@ kern_return_t IMPL(TinyGPUDriverUserClient, CopyClientMemoryForType)
+ 	if (!memory) return kIOReturnBadArgument;
+ 	if (!ivars->provider.get()) return kIOReturnNotAttached;
+ 
+-	// bar handling, type is bar num
+-	if (type < 6) {
+-		uint32_t bar = (uint32_t)type;
+-		return ivars->provider->MapBar(bar, memory);
+-	}
++	// 0..5 = BAR n uncached, 8..13 = BAR n-8 write-combined,
++	// >= 0x10000 and a 16 KiB multiple = dext-allocated DMA buffer of that size, anything else refused
++	// (before: any type 6..65535 allocated a tiny DMA buffer)
++	if (type < 6) return ivars->provider->MapBar((uint32_t)type, false, memory);
++	if (type >= 8 && type < 14) return ivars->provider->MapBar((uint32_t)(type - 8), true, memory);
++	if (type < 0x10000 || (type & 0x3fff)) return kIOReturnBadArgument;
+ 
+ 	// dma handling, type is size
+ 	if (ivars->ensureDMACap(ivars->dmaCount + 1)) {
+@@ -185,7 +206,9 @@ kern_return_t IMPL(TinyGPUDriverUserClient, CopyClientMemoryForType)
+ 	kern_return_t err = ivars->provider->CreateDMA(type, &buf);
+ 	if (err) return err;
+ 
++	// the caller consumes one reference (IOUserClient.iig), keep our own for Stop
++	buf.mem->retain();
+ 	ivars->dmas[ivars->dmaCount++] = buf;
+-	*memory = buf.sharedBuf;
++	*memory = buf.mem;
+ 	return 0;
+ }
+diff --git a/TinyGPUDriverExtension/TinyGPUDriverUserClient.iig b/TinyGPUDriverExtension/TinyGPUDriverUserClient.iig
+--- a/TinyGPUDriverExtension/TinyGPUDriverUserClient.iig
++++ b/TinyGPUDriverExtension/TinyGPUDriverUserClient.iig
+@@ -9,6 +9,7 @@ enum TinyGPURPC
+ 	WriteCfg,
+ 	Reset,
+ 	PrepareDMA,
++	CompleteDMA, // selector 4, free one PrepareDMA handle
+ };
+ 
+ class TinyGPUDriverUserClient : public IOUserClient
